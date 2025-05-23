@@ -1,0 +1,13 @@
+.cupy
+lists_info/*
+search_logs/*
+trained_indices/*
+server_query.log
+
+# Environment files with sensitive data
+config.env
+.env
+test_embedding_read.log
+.vscode-server
+
+

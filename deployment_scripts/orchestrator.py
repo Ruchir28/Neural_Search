@@ -113,9 +113,12 @@ class SemanticSearchOrchestrator:
         self.security_group_id = None
         self._initialize_aws_resources()
         
-        # Start background tasks
-        asyncio.create_task(self._health_check_loop())
-        asyncio.create_task(self._cleanup_loop())
+        # Add startup event to create background tasks
+        @self.app.on_event("startup")
+        async def startup_event():
+            # Start background tasks after event loop is running
+            asyncio.create_task(self._health_check_loop())
+            asyncio.create_task(self._cleanup_loop())
 
     def _create_ec2_client(self):
         """Create EC2 client with optimized configuration"""

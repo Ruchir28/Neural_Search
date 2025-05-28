@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Simple script to run the orchestrator with environment configuration
+Simple script to run the refactored orchestrator with environment configuration
 """
 
 import os
@@ -30,7 +30,7 @@ def main():
         print("Please copy orchestrator_config.env.example to orchestrator_config.env and configure it.")
         
         # Check if required environment variables are set
-        required_vars = ["EBS_VOLUME_ID"]
+        required_vars = ["EBS_VOLUME_ID", "COHERE_API_KEY"]
         missing_vars = [var for var in required_vars if not os.getenv(var)]
         
         if missing_vars:
@@ -39,7 +39,7 @@ def main():
     
     # Import and run orchestrator
     try:
-        from orchestrator import main as orchestrator_main
+        from orchestrator_v2 import main as orchestrator_main
         orchestrator_main()
     except ImportError as e:
         print(f"ERROR: Failed to import orchestrator: {e}")

@@ -18,15 +18,21 @@ from dotenv import load_dotenv
 # Load environment variables from config.env file
 load_dotenv('config.env')
 
-INDEX_PATH = Path("trained_indices/trained_ivfpq_index_full.bin")
+# Configurable paths via environment variables
+DATA_DIR = os.getenv("DATA_DIR", ".")
+INDEX_PATH = Path(os.getenv("INDEX_PATH", f"{DATA_DIR}/trained_indices/trained_ivfpq_index_full.bin"))
+EMBEDDINGS_PATH = os.getenv("EMBEDDINGS_PATH", f"{DATA_DIR}/lists_info/embeddings_listwise.memmap")
+IVF_PQ_LAYOUT_PATH = os.getenv("IVF_PQ_LAYOUT_PATH", f"{DATA_DIR}/lists_info/layout_sorted.npz")
+ID_TO_SORTED_ROW_PATH = os.getenv("ID_TO_SORTED_ROW_PATH", f"{DATA_DIR}/lists_info/vec_id_to_sorted_row.bin.npy")
+LMDB_META_PATH = os.getenv("LMDB_META_PATH", f"{DATA_DIR}/lists_info/metadata_25gb.lmdb")
+
+# Performance configuration
+LOAD_EMBEDDINGS_TO_RAM = os.getenv("LOAD_EMBEDDINGS_TO_RAM", "false").lower() in ("true", "1", "yes")
+
 OVERSAMPLE_K = 1000  
 FINAL_K = 15  
 N_PROBES_SEARCH = 40  
 COHERE_API_KEY = os.getenv("COHERE_API_KEY")
-EMBEDDINGS_PATH = "lists_info/embeddings_listwise.memmap"
-IVF_PQ_LAYOUT_PATH = "lists_info/layout_sorted.npz"
-ID_TO_SORTED_ROW_PATH = "lists_info/vec_id_to_sorted_row.bin.npy"
-LMDB_META_PATH = "lists_info/metadata.lmdb"
 VECTOR_DIM = 768  
 
 index_global = None
@@ -60,49 +66,81 @@ class QueryResponse(BaseModel):
     timings: dict
 
 
-def get_vectors_server(ids: np.ndarray, emb_map: np.memmap, id_to_sorted_row_map: np.ndarray, current_layout_prefix: np.ndarray) -> np.ndarray:
-    """
-    Fetches full embedding vectors for given original vector IDs.
-    Assumes emb_map contains embeddings sorted list-wise.
-    Now uses global thread pool to parallelize list processing for better performance.
-    """
-    rows = id_to_sorted_row_map[ids]  # Convert original IDs to sorted row indices
-    # Determine which list each sorted row index belongs to
+def get_vectors_server(ids: np.ndarray, emb_map: np.ndarray, id_to_sorted_row_map: np.ndarray, current_layout_prefix: np.ndarray) -> np.ndarray:
+    start_time = time.perf_counter()
+    rows = id_to_sorted_row_map[ids]
     lists = np.searchsorted(current_layout_prefix, rows, 'right') - 1
     out = np.empty((len(ids), VECTOR_DIM), dtype=np.float16)
+    print(f"Setup time: {time.perf_counter() - start_time:.4f} s")
 
     def process_list(list_idx):
-        """Process a single list and return mask and vectors for that list."""
+        start = time.perf_counter()
         start_offset = current_layout_prefix[list_idx]
-        # Assumes current_layout_prefix has num_lists + 1 elements for the end boundary
-        end_offset = current_layout_prefix[list_idx + 1] 
+        end_offset = current_layout_prefix[list_idx + 1]
         mask = (lists == list_idx)
-        # Offsets within the specific list's block in emb_map
         offsets_in_list_block = rows[mask] - start_offset
         vectors = emb_map[start_offset:end_offset][offsets_in_list_block]
+        print(f"List {list_idx} fetch time: {time.perf_counter() - start:.4f} s")
         return mask, vectors
 
     unique_lists = np.unique(lists)
-    
-    # If only one list, no need for threading overhead
-    if len(unique_lists) == 1:
-        list_idx = unique_lists[0]
-        start_offset = current_layout_prefix[list_idx]
-        end_offset = current_layout_prefix[list_idx + 1] 
-        mask = (lists == list_idx)
-        offsets_in_list_block = rows[mask] - start_offset
-        out[mask] = emb_map[start_offset:end_offset][offsets_in_list_block]
-    else:
-        # Use global thread pool for multiple lists
-        futures = {thread_pool_global.submit(process_list, list_idx): list_idx 
-                  for list_idx in unique_lists}
-        
-        # Collect results as they complete
-        for future in as_completed(futures):
-            mask, vectors = future.result()
-            out[mask] = vectors
 
-    return out # Returns float16 vectors
+    fetch_start = time.perf_counter()
+    futures = {thread_pool_global.submit(process_list, list_idx): list_idx 
+                for list_idx in unique_lists}
+    for future in as_completed(futures):
+        mask, vectors = future.result()
+        out[mask] = vectors
+    print(f"Total fetch time: {time.perf_counter() - fetch_start:.4f} s")
+
+    print(f"Total time: {time.perf_counter() - start_time:.4f} s")
+    return out
+
+
+
+# def get_vectors_server(ids: np.ndarray, emb_map: np.memmap, id_to_sorted_row_map: np.ndarray, current_layout_prefix: np.ndarray) -> np.ndarray:
+#     """
+#     Fetches full embedding vectors for given original vector IDs.
+#     Assumes emb_map contains embeddings sorted list-wise.
+#     Now uses global thread pool to parallelize list processing for better performance.
+#     """
+#     rows = id_to_sorted_row_map[ids]  # Convert original IDs to sorted row indices
+#     # Determine which list each sorted row index belongs to
+#     lists = np.searchsorted(current_layout_prefix, rows, 'right') - 1
+#     out = np.empty((len(ids), VECTOR_DIM), dtype=np.float16)
+
+#     def process_list(list_idx):
+#         """Process a single list and return mask and vectors for that list."""
+#         start_offset = current_layout_prefix[list_idx]
+#         # Assumes current_layout_prefix has num_lists + 1 elements for the end boundary
+#         end_offset = current_layout_prefix[list_idx + 1] 
+#         mask = (lists == list_idx)
+#         # Offsets within the specific list's block in emb_map
+#         offsets_in_list_block = rows[mask] - start_offset
+#         vectors = emb_map[start_offset:end_offset][offsets_in_list_block]
+#         return mask, vectors
+
+#     unique_lists = np.unique(lists)
+    
+#     # If only one list, no need for threading overhead
+#     if len(unique_lists) == 1:
+#         list_idx = unique_lists[0]
+#         start_offset = current_layout_prefix[list_idx]
+#         end_offset = current_layout_prefix[list_idx + 1] 
+#         mask = (lists == list_idx)
+#         offsets_in_list_block = rows[mask] - start_offset
+#         out[mask] = emb_map[start_offset:end_offset][offsets_in_list_block]
+#     else:
+#         # Use global thread pool for multiple lists
+#         futures = {thread_pool_global.submit(process_list, list_idx): list_idx 
+#                   for list_idx in unique_lists}
+        
+#         # Collect results as they complete
+#         for future in as_completed(futures):
+#             mask, vectors = future.result()
+#             out[mask] = vectors
+
+#     return out # Returns float16 vectors
 
 def get_metadata_lmdb_server(original_vector_ids: np.ndarray, txn: lmdb.Transaction, db: Any, id_to_sorted_row_map: np.ndarray):
     """
@@ -182,13 +220,32 @@ async def startup_event():
     index_global = ivf_pq.load(str(INDEX_PATH))
     logging.info("IVF-PQ index loaded.")
 
-    # --- Load embeddings memmap ---
+    # --- Load embeddings (RAM vs memory-mapped) ---
     if not Path(EMBEDDINGS_PATH).exists():
         logging.error(f"Embeddings file not found: {EMBEDDINGS_PATH}")
         raise RuntimeError(f"Embeddings file not found: {EMBEDDINGS_PATH}")
-    # Ensure the shape is correctly derived using total_embeddings
-    embeddings_global = np.memmap(EMBEDDINGS_PATH, dtype=np.float16, mode="r", shape=(total_embeddings, VECTOR_DIM))
-    logging.info("Embeddings memmap loaded.")
+    
+    # Calculate memory requirements
+    embedding_size_gb = (total_embeddings * VECTOR_DIM * 2) / (1024**3)  # 2 bytes per float16
+    
+    if LOAD_EMBEDDINGS_TO_RAM:
+        logging.info(f"Loading embeddings into RAM (requires ~{embedding_size_gb:.1f} GB)...")
+        logging.warning(f"This will consume {embedding_size_gb:.1f} GB of system RAM!")
+        
+        # Load embeddings entirely into RAM for maximum performance
+        embeddings_mmap = np.memmap(EMBEDDINGS_PATH, dtype=np.float16, mode="r", shape=(total_embeddings, VECTOR_DIM))
+        embeddings_global = np.array(embeddings_mmap, dtype=np.float16)  # Copy to RAM
+        del embeddings_mmap  # Free the memmap reference
+        
+        logging.info(f"Embeddings loaded into RAM ({embedding_size_gb:.1f} GB). Maximum performance mode enabled.")
+    else:
+        logging.info(f"Using memory-mapped embeddings (file size: ~{embedding_size_gb:.1f} GB)")
+        logging.info("For better performance on systems with sufficient RAM, set LOAD_EMBEDDINGS_TO_RAM=true")
+        
+        # Use memory-mapped file (lazy loading, lower memory usage)
+        embeddings_global = np.memmap(EMBEDDINGS_PATH, dtype=np.float16, mode="r", shape=(total_embeddings, VECTOR_DIM))
+        
+        logging.info("Embeddings memmap loaded (memory-efficient mode).")
 
     # --- Load IVF-PQ layout (prefix for get_vectors_server) ---
     if not Path(IVF_PQ_LAYOUT_PATH).exists():
@@ -201,7 +258,7 @@ async def startup_event():
     # --- Open LMDB environment ---
     if not Path(LMDB_META_PATH).exists(): # LMDB_META_PATH is a directory
         logging.error(f"LMDB_META_PATH directory not found: {LMDB_META_PATH}")
-        raise RuntimeError(f"LMDB_META_PATH directory not found: {LMDB_META_PATH}")
+        raise RuntimeError(f"LMDB_META_PATH directory not found {LMDB_META_PATH}")
     lmdb_env_global = lmdb.open(LMDB_META_PATH, readonly=True, lock=False, max_dbs=2, max_readers=200, readahead=True) # readahead=False for mmap
     lmdb_metadata_db_global = lmdb_env_global.open_db(b'metadata')
     logging.info("LMDB environment opened.")
@@ -268,7 +325,24 @@ async def startup_event():
         logging.error(f"Error during warmup: {e}", exc_info=True)
         # Don't raise here, allow server to start if possible, but log failure.
 
-    logging.info(f"Server startup complete. Total time: {time.perf_counter() - startup_timer_start:.4f} seconds")
+    # Touch embeddings pages to pre-load into memory (only for memory-mapped files)
+    if not LOAD_EMBEDDINGS_TO_RAM:
+        logging.info("Pre-loading embeddings memmap into memory...")
+        touch_start_time = time.perf_counter()
+
+        for i in range(0, total_embeddings, 1000000):
+            start_idx = i
+            end_idx = min(start_idx + 1000000, total_embeddings)
+            _ = embeddings_global[start_idx:end_idx]
+            if i % 1000000 == 0:  # Log progress
+                logging.info(f"Touched {i:,} vectors...")
+
+        touch_end_time = time.perf_counter()
+        logging.info(f"Embeddings memmap pre-loading completed in {touch_end_time - touch_start_time:.2f}s")
+    else:
+        logging.info("Skipping embeddings pre-loading (already in RAM)")
+
+    logging.info(f"Server startup is completed. Total time: {time.perf_counter() - startup_timer_start:.4f} seconds")
 
 
 @app.on_event("shutdown")
@@ -286,6 +360,49 @@ async def shutdown_event():
     # cp.get_default_pinned_memory_pool().free_all_blocks()
     logging.info("Server shutdown complete.")
 
+
+@app.get("/health")
+async def health_check():
+    """Health check endpoint for orchestrator"""
+    # Check if all global resources are initialized
+    expected_globals = [
+        index_global, cohere_client_global, embeddings_global, 
+        id_to_sorted_row_global, layout_prefix_global, 
+        lmdb_env_global, lmdb_metadata_db_global
+    ]
+    
+    if any(item is None for item in expected_globals):
+        raise HTTPException(status_code=503, detail="Server not fully initialized")
+    
+    return {"status": "healthy", "message": "Semantic search server is ready"}
+
+@app.get("/status")
+async def status_check():
+    """Detailed status endpoint"""
+    # Check if all global resources are initialized
+    expected_globals = [
+        index_global, cohere_client_global, embeddings_global, 
+        id_to_sorted_row_global, layout_prefix_global, 
+        lmdb_env_global, lmdb_metadata_db_global
+    ]
+    
+    global_names = [
+        "index_global", "cohere_client_global", "embeddings_global",
+        "id_to_sorted_row_global", "layout_prefix_global",
+        "lmdb_env_global", "lmdb_metadata_db_global"
+    ]
+    
+    status = {}
+    for i, item in enumerate(expected_globals):
+        status[global_names[i]] = "initialized" if item is not None else "not_initialized"
+    
+    all_ready = all(item is not None for item in expected_globals)
+    
+    return {
+        "status": "ready" if all_ready else "initializing",
+        "components": status,
+        "ready": all_ready
+    }
 
 @app.post("/query", response_model=QueryResponse)
 async def handle_query(request: QueryRequest):

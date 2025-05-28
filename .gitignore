@@ -11,3 +11,4 @@ test_embedding_read.log
 .vscode-server
 
 
+.aws/*

@@ -42,7 +42,6 @@ COHERE_API_KEY=your_cohere_api_key_here
 # Optional
 AWS_REGION=us-east-1
 EC2_INSTANCE_TYPE=g4dn.4xlarge
-MAX_INSTANCES=3
 INSTANCE_IDLE_TIMEOUT=1800
 
 # Spot Instance Configuration (Cost Savings)
@@ -64,9 +63,9 @@ python run_orchestrator.py
 
 - `POST /query` - Submit semantic search queries
 - `GET /status` - View orchestration status and instance health
-- `POST /scale-up?count=N` - Launch additional instances
-- `POST /scale-down?count=N` - Terminate idle instances
-- `DELETE /instance/{instance_id}` - Terminate specific instance
+- `POST /scale-up?count=N` - Launch a replacement instance (max 1 due to EBS)
+- `POST /scale-down?count=N` - Shut down the service (terminates the instance)
+- `DELETE /instance/{instance_id}` - Force terminate specific instance
 
 ## Instance Lifecycle
 
@@ -202,13 +201,13 @@ curl http://localhost:8080/status
 ### Manual Scaling
 
 ```bash
-# Scale up (launch more instances)
-curl -X POST "http://localhost:8080/scale-up?count=2"
+# Scale up (launch replacement instance if none exists)
+curl -X POST "http://localhost:8080/scale-up?count=1"
 
-# Scale down (terminate idle instances)
+# Scale down (shut down service by terminating instance)
 curl -X POST "http://localhost:8080/scale-down?count=1"
 
-# Terminate specific instance
+# Force terminate specific instance
 curl -X DELETE "http://localhost:8080/instance/i-1234567890abcdef0"
 ```
 
@@ -225,7 +224,6 @@ curl -X DELETE "http://localhost:8080/instance/i-1234567890abcdef0"
 | `EC2_SUBNET_ID` | *Auto-detected* | Subnet ID (must be in same AZ as EBS) |
 | `USE_SPOT_INSTANCES` | `false` | Use spot instances for cost savings |
 | `SPOT_MAX_PRICE` | *Current price* | Maximum price for spot instances (optional) |
-| `MAX_INSTANCES` | `3` | Maximum instances to run |
 | `INSTANCE_IDLE_TIMEOUT` | `1800` | Seconds before terminating idle instances |
 | `INSTANCE_MAX_RUNTIME` | `1800` | Maximum seconds an instance can run (30 min default) |
 | `HEALTH_CHECK_INTERVAL` | `60` | Seconds between health checks |
@@ -258,6 +256,17 @@ curl -X DELETE "http://localhost:8080/instance/i-1234567890abcdef0"
 
 If you specify `EC2_SUBNET_ID`, ensure it's in the same AZ as your EBS volume.
 
+### Single Instance Limitation
+
+🔒 **Important**: Due to EBS volume constraints, only **one instance can run at a time**:
+
+- EBS volumes can only be attached to one EC2 instance
+- The orchestrator enforces single-instance operation
+- Scale-up requests are limited to single instance replacement
+- Multiple scale-up calls are protected by locks to prevent race conditions
+
+This means the orchestrator provides **high availability through replacement**, not horizontal scaling.
+
 ### Security Groups
 
 The orchestrator automatically creates a security group with:
@@ -277,7 +286,6 @@ Instances take 5-10 minutes to become ready because they need to:
 
 - Instances auto-terminate after 30 minutes of inactivity
 - Instances are force-terminated after 30 minutes of total runtime (configurable)
-- Use `MAX_INSTANCES` to control costs
 - Monitor with `GET /status` endpoint
 
 ### Spot Instances
@@ -358,13 +366,68 @@ Get orchestrator status
 
 ### POST /scale-up
 Launch additional instances
-- **Query**: `?count=2`
-- **Response**: List of launched instances
+- **Query**: `?count=1`
+- **Success Response**: 
+  ```json
+  {
+    "message": "Instance launched successfully", 
+    "launched_instances": [
+      {
+        "instance_id": "i-1234567890abcdef0",
+        "status": "launching",
+        "created_at": "2024-01-15T10:30:00.123456",
+        "public_ip": "pending"
+      }
+    ], 
+    "total_instances": 1
+  }
+  ```
+- **Error Response (already have instance)**: 
+  ```json
+  {
+    "error": "Cannot scale up: already have an instance", 
+    "existing_instances": [
+      {
+        "instance_id": "i-1234567890abcdef0",
+        "status": "ready",
+        "created_at": "2024-01-15T10:25:00.123456",
+        "public_ip": "54.123.45.67",
+        "last_used": "2024-01-15T10:35:00.123456"
+      }
+    ],
+    "total_instances": 1
+  }
+  ```
+- **Error Response (launch in progress)**: 
+  ```json
+  {
+    "error": "Cannot scale up: instance launch already in progress", 
+    "launching_instances": [
+      {
+        "instance_id": "i-0987654321fedcba0",
+        "status": "launching",
+        "created_at": "2024-01-15T10:32:00.123456",
+        "public_ip": "pending"
+      }
+    ],
+    "all_instances": [
+      {
+        "instance_id": "i-0987654321fedcba0",
+        "status": "launching",
+        "created_at": "2024-01-15T10:32:00.123456",
+        "public_ip": "pending",
+        "last_used": null
+      }
+    ],
+    "total_instances": 1
+  }
+  ```
 
 ### POST /scale-down
 Terminate idle instances
 - **Query**: `?count=1`
-- **Response**: List of terminated instances
+- **Success Response**: `{"message": "Service shut down", "terminated_instances": ["i-123"], "total_instances": 0}`
+- **Error Response**: `{"error": "Cannot terminate: instance is busy", "total_instances": 1}`
 
 ### DELETE /instance/{instance_id}
 Terminate specific instance

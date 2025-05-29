@@ -85,7 +85,7 @@ class SemanticSearchOrchestrator:
             # Health check all active instances
             health_check_tasks = []
             for instance in self.instance_manager.instances.values():
-                if instance.status.value in ['ready', 'idle', 'busy']:
+                if instance.status.value in ['ready']:
                     task = asyncio.create_task(
                         self.instance_manager.health_check_instance(instance)
                     )
@@ -95,7 +95,7 @@ class SemanticSearchOrchestrator:
                 await asyncio.gather(*health_check_tasks, return_exceptions=True)
     
     async def _cleanup_loop(self):
-        """Periodic cleanup of idle and failed instances"""
+        """Periodic cleanup of inactive and failed instances"""
         while True:
             await asyncio.sleep(300)  # Check every 5 minutes
             
@@ -121,18 +121,18 @@ class SemanticSearchOrchestrator:
                 except Exception as e:
                     print(f"Failed to terminate long-running instance {instance.instance_id}: {e}")
             
-            # Terminate idle instances that have been idle too long
-            idle_instances = self.instance_manager.get_idle_instances()
+            # Terminate instances that are not processing requests and have been inactive too long
+            inactive_instances = self.instance_manager.get_idle_instances()
             
-            for instance in idle_instances:
-                idle_time = (current_time - instance.last_used).total_seconds()
-                if idle_time > self.config.instance_idle_timeout:
-                    idle_minutes = int(idle_time / 60)
-                    print(f"Terminating idle instance {instance.instance_id} (idle for {idle_minutes} minutes)")
+            for instance in inactive_instances:
+                inactive_time = (current_time - instance.last_used).total_seconds()
+                if inactive_time > self.config.instance_idle_timeout:
+                    inactive_minutes = int(inactive_time / 60)
+                    print(f"Terminating inactive instance {instance.instance_id} (inactive for {inactive_minutes} minutes)")
                     try:
                         await self.instance_manager.terminate_instance(instance.instance_id)
                     except Exception as e:
-                        print(f"Failed to terminate idle instance {instance.instance_id}: {e}")
+                        print(f"Failed to terminate inactive instance {instance.instance_id}: {e}")
 
 def main():
     """Main function to run the orchestrator"""

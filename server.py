@@ -8,6 +8,7 @@ import logging
 import lmdb
 import struct
 from fastapi import FastAPI, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import uvicorn
 import os
@@ -51,6 +52,15 @@ logging.basicConfig(
 )
 
 app = FastAPI(title="Semantic Search Server")
+
+# Add CORS middleware to allow frontend access
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # In production, replace with your frontend domain
+    allow_credentials=True,
+    allow_methods=["GET", "POST"],
+    allow_headers=["*"],
+)
 
 class QueryRequest(BaseModel):
     query: str

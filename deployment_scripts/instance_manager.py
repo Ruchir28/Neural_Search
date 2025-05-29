@@ -18,6 +18,7 @@ class InstanceManager:
         self.config = config
         self.aws_manager = aws_manager
         self.instances: Dict[str, ManagedInstance] = {}
+        self._launching_lock = asyncio.Lock()  # Prevent race conditions during launch
     
     def discover_existing_instances(self):
         """Discover and reconnect to existing instances using AWS tags"""
@@ -127,43 +128,51 @@ class InstanceManager:
     async def launch_instance(self) -> str:
         """Launch a new EC2 instance with the EBS volume attached"""
         
-        # Create user data script to setup the instance
-        user_data = self._create_user_data_script()
-        
-        try:
-            # Launch instance
-            instance_data = self.aws_manager.launch_instance(user_data)
-            instance_id = instance_data['InstanceId']
+        async with self._launching_lock:
+            if len(self.instances) >= 1:
+                raise ValueError(f"Cannot launch instance: already have {len(self.instances)} instances (EBS volume can only attach to one instance)")
             
-            # Wait for instance to be running
-            self.aws_manager.wait_for_instance_running(instance_id)
+            # Check if any instance is currently launching
+            for instance in self.instances.values():
+                if instance.status in [InstanceStatus.LAUNCHING, InstanceStatus.STARTING]:
+                    raise ValueError("Cannot launch instance: another instance is already launching/starting")
             
-            # Get updated instance details
-            instance_data = self.aws_manager.get_instance_details(instance_id)
+            # Create user data script to setup the instance
+            user_data = self._create_user_data_script()
             
-            # Attach EBS volume
-            self.aws_manager.attach_ebs_volume(instance_id)
-            
-            # Create managed instance
-            managed_instance = ManagedInstance(
-                instance_id=instance_id,
-                public_ip=instance_data.get('PublicIpAddress', ''),
-                private_ip=instance_data.get('PrivateIpAddress', ''),
-                status=InstanceStatus.STARTING,
-                created_at=datetime.now(),
-                last_used=datetime.now()
-            )
-            
-            self.instances[instance_id] = managed_instance
-            
-            # Start monitoring the instance
-            asyncio.create_task(self._monitor_instance_startup(instance_id))
-            
-            return instance_id
-            
-        except Exception as e:
-            print(f"Failed to launch instance: {e}")
-            raise
+            try:
+                # Launch instance
+                instance_data = self.aws_manager.launch_instance(user_data)
+                instance_id = instance_data['InstanceId']
+                
+                # Wait for instance to be running
+                self.aws_manager.wait_for_instance_running(instance_id)
+                
+                # Get updated instance details
+                instance_data = self.aws_manager.get_instance_details(instance_id)
+                
+                self.aws_manager.attach_ebs_volume(instance_id)
+                
+                # Create managed instance
+                managed_instance = ManagedInstance(
+                    instance_id=instance_id,
+                    public_ip=instance_data.get('PublicIpAddress', ''),
+                    private_ip=instance_data.get('PrivateIpAddress', ''),
+                    status=InstanceStatus.STARTING,
+                    created_at=datetime.now(),
+                    last_used=datetime.now()
+                )
+                
+                self.instances[instance_id] = managed_instance
+                
+                # Start monitoring the instance
+                asyncio.create_task(self._monitor_instance_startup(instance_id))
+                
+                return instance_id
+                
+            except Exception as e:
+                print(f"Failed to launch instance: {e}")
+                raise
     
     def _create_user_data_script(self) -> str:
         """Create user data script for instance initialization"""
@@ -183,7 +192,7 @@ yum update -y
 
 # Install git and curl (Python and pip are already available in Deep Learning AMI)
 log "Installing git and curl..."
-yum install git curl -y
+yum install git curl -y --allowerasing
 
 # Mount EBS volume
 log "Setting up EBS volume mount..."
@@ -343,26 +352,30 @@ log "Semantic search server setup completed successfully"
     async def get_available_instance(self) -> Optional[ManagedInstance]:
         """Get an available instance, launching one if necessary"""
         
-        # Check for idle instances first
+        # Check for ready instances that can serve requests
         for instance in self.instances.values():
-            if instance.status == InstanceStatus.IDLE:
+            if instance.is_ready_to_serve:
                 return instance
         
-        # Check for ready instances with low load
-        for instance in self.instances.values():
-            if instance.status == InstanceStatus.READY and instance.current_requests == 0:
-                return instance
+        # If no available instances and no instances exist, launch one
+        if len(self.instances) == 0:
+            try:
+                await self.launch_instance()
+                # Wait a bit for the instance to start launching
+                await asyncio.sleep(1)
+                
+                # Return the launching instance (caller will need to wait)
+                for instance in self.instances.values():
+                    if instance.status in [InstanceStatus.LAUNCHING, InstanceStatus.STARTING]:
+                        return await self._wait_for_instance_ready(instance)
+            except ValueError as e:
+                print(f"Cannot launch instance: {e}")
+                return None
         
-        # If no available instances and under limit, launch a new one
-        if len(self.instances) < self.config.max_instances:
-            await self.launch_instance()
-            # Wait a bit for the instance to start launching
-            await asyncio.sleep(1)
-            
-            # Return the launching instance (caller will need to wait)
-            for instance in self.instances.values():
-                if instance.status == InstanceStatus.LAUNCHING:
-                    return await self._wait_for_instance_ready(instance)
+        # If we have an instance but it's not ready, wait for it
+        for instance in self.instances.values():
+            if instance.status in [InstanceStatus.LAUNCHING, InstanceStatus.STARTING]:
+                return await self._wait_for_instance_ready(instance)
         
         return None
     
@@ -389,8 +402,6 @@ log "Semantic search server setup completed successfully"
                 response = await client.get(f"http://{instance.public_ip}:8000/health")
                 if response.status_code == 200:
                     instance.health_check_failures = 0
-                    if instance.status == InstanceStatus.BUSY and instance.current_requests == 0:
-                        instance.status = InstanceStatus.IDLE
                 else:
                     instance.health_check_failures += 1
         except:
@@ -432,7 +443,10 @@ log "Semantic search server setup completed successfully"
             del self.instances[instance_id]
     
     def get_idle_instances(self) -> List[ManagedInstance]:
-        """Get list of idle instances, sorted by last used time"""
-        idle_instances = [i for i in self.instances.values() if i.status == InstanceStatus.IDLE]
+        """Get list of ready instances that are not processing requests, sorted by last used time"""
+        idle_instances = [
+            i for i in self.instances.values() 
+            if i.is_ready_to_serve and not i.is_processing_requests
+        ]
         idle_instances.sort(key=lambda x: x.last_used)  # Least recently used first
         return idle_instances 

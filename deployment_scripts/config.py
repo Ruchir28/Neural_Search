@@ -25,7 +25,6 @@ class OrchestratorConfig:
     load_embeddings_to_ram: bool
     
     # Instance Management Settings
-    max_instances: int
     instance_idle_timeout: int
     instance_max_runtime: int
     health_check_interval: int
@@ -60,7 +59,6 @@ class OrchestratorConfig:
             load_embeddings_to_ram=os.getenv("LOAD_EMBEDDINGS_TO_RAM", "false").lower() in ("true", "1", "yes"),
             
             # Instance Management Settings
-            max_instances=int(os.getenv("MAX_INSTANCES", "1")),
             instance_idle_timeout=int(os.getenv("INSTANCE_IDLE_TIMEOUT", "1800")),
             instance_max_runtime=int(os.getenv("INSTANCE_MAX_RUNTIME", "1800")),
             health_check_interval=int(os.getenv("HEALTH_CHECK_INTERVAL", "60"))

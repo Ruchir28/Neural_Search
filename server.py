@@ -63,8 +63,9 @@ initialization_status = {
         "embeddings": {"status": "pending", "message": "Loading embeddings"},
         "layout": {"status": "pending", "message": "Loading IVF-PQ layout"},
         "lmdb": {"status": "pending", "message": "Opening LMDB environment"},
+        "lmdb_page_warmup": {"status": "pending", "message": "Warming up LMDB pages"},
         "thread_pool": {"status": "pending", "message": "Initializing thread pool"},
-        "warmup": {"status": "pending", "message": "Running warmup queries"}
+        "app_warmup": {"status": "pending", "message": "Running application warmup queries"}
     }
 }
 initialization_lock = threading.Lock()
@@ -198,10 +199,10 @@ async def initialize_server_async():
         logging.info("Starting asynchronous server initialization...")
         startup_timer_start = time.perf_counter()
 
+        # --- Sequential Part 1 ---
         # Stage 1: Cohere Client
-        update_initialization_status(stage="cohere_client", progress=10, message="Initializing Cohere client...")
+        update_initialization_status(stage="cohere_client", progress=5, message="Initializing Cohere client...")
         update_stage_status("cohere_client", "in_progress")
-        
         if not COHERE_API_KEY:
             raise RuntimeError("COHERE_API_KEY not configured.")
         cohere_client_global = cohere.Client(COHERE_API_KEY)
@@ -209,91 +210,150 @@ async def initialize_server_async():
         logging.info("Cohere client initialized.")
 
         # Stage 2: ID Mapping
-        update_initialization_status(stage="id_mapping", progress=20, message="Loading ID to sorted row mapping...")
+        update_initialization_status(stage="id_mapping", progress=10, message="Loading ID to sorted row mapping...")
         update_stage_status("id_mapping", "in_progress")
-        
-        if not Path(ID_TO_SORTED_ROW_PATH).exists():
-            raise RuntimeError(f"ID_TO_SORTED_ROW_PATH file not found: {ID_TO_SORTED_ROW_PATH}")
-        id_to_sorted_row_global = np.load(ID_TO_SORTED_ROW_PATH, mmap_mode="r")
+        if not Path(ID_TO_SORTED_ROW_PATH).exists(): raise RuntimeError(f"ID_TO_SORTED_ROW_PATH file not found: {ID_TO_SORTED_ROW_PATH}")
+        def _load_id_map_sync():
+            logging.info(f"Worker thread: Loading ID to sorted row map from {ID_TO_SORTED_ROW_PATH}...")
+            loaded_map = np.load(ID_TO_SORTED_ROW_PATH)
+            map_size_mb = loaded_map.nbytes / (1024**2)
+            logging.info(f"Worker thread: ID to sorted row map loaded into RAM ({map_size_mb:.1f} MB).")
+            return loaded_map
+        id_to_sorted_row_global = await asyncio.to_thread(_load_id_map_sync)
         total_embeddings = len(id_to_sorted_row_global)
         update_stage_status("id_mapping", "completed", f"ID mapping loaded. Total items: {total_embeddings:,}")
         logging.info(f"ID to sorted row map loaded. Total items: {total_embeddings}")
 
         # Stage 3: Index
-        update_initialization_status(stage="index", progress=30, message="Loading IVF-PQ index...")
+        update_initialization_status(stage="index", progress=15, message="Loading IVF-PQ index...")
         update_stage_status("index", "in_progress")
-        
-        if not INDEX_PATH.exists():
-            raise RuntimeError(f"Index file not found: {INDEX_PATH}")
-        index_global = ivf_pq.load(str(INDEX_PATH))
+        if not INDEX_PATH.exists(): raise RuntimeError(f"Index file not found: {INDEX_PATH}")
+        def _load_index_sync():
+            logging.info("Worker thread: Loading IVF-PQ index...")
+            idx = ivf_pq.load(str(INDEX_PATH))
+            logging.info("Worker thread: IVF-PQ index loaded.")
+            return idx
+        index_global = await asyncio.to_thread(_load_index_sync)
         update_stage_status("index", "completed", "IVF-PQ index loaded")
         logging.info("IVF-PQ index loaded.")
 
-        # Stage 4: Embeddings (this is the longest stage)
-        embedding_size_gb = (total_embeddings * VECTOR_DIM * 2) / (1024**3)
-        update_initialization_status(stage="embeddings", progress=40, 
-                                    message=f"Loading embeddings ({embedding_size_gb:.1f} GB)...")
-        update_stage_status("embeddings", "in_progress")
-        
-        if not Path(EMBEDDINGS_PATH).exists():
-            raise RuntimeError(f"Embeddings file not found: {EMBEDDINGS_PATH}")
-        
-        if LOAD_EMBEDDINGS_TO_RAM:
-            update_stage_status("embeddings", "in_progress", f"Loading {embedding_size_gb:.1f} GB into RAM...")
-            logging.info(f"Loading embeddings into RAM (requires ~{embedding_size_gb:.1f} GB)...")
-            
-            mmap_view = np.memmap(EMBEDDINGS_PATH, dtype=np.float16, mode="r", shape=(total_embeddings, VECTOR_DIM))
-            
-            embeddings_global = mmap_view.copy(order="C")
-            
-            mmap_view._mmap.close()   # low-level unmap
-            del mmap_view             # drop Python ref
-            
-            update_stage_status("embeddings", "completed", f"Embeddings loaded into RAM ({embedding_size_gb:.1f} GB)")
-            logging.info(f"Embeddings loaded into RAM ({embedding_size_gb:.1f} GB). Maximum performance mode enabled.")
-        else:
-            embeddings_global = np.memmap(EMBEDDINGS_PATH, dtype=np.float16, mode="r", shape=(total_embeddings, VECTOR_DIM))
-            update_stage_status("embeddings", "completed", f"Embeddings memmap loaded ({embedding_size_gb:.1f} GB)")
-            logging.info("Embeddings memmap loaded (memory-efficient mode).")
-
-        # Stage 5: Layout
-        update_initialization_status(stage="layout", progress=60, message="Loading IVF-PQ layout...")
+        # Stage 5: Layout (Original stage number, keeping sequence)
+        update_initialization_status(stage="layout", progress=20, message="Loading IVF-PQ layout...")
         update_stage_status("layout", "in_progress")
-        
-        if not Path(IVF_PQ_LAYOUT_PATH).exists():
-            raise RuntimeError(f"IVF_PQ_LAYOUT_PATH file not found: {IVF_PQ_LAYOUT_PATH}")
-        layout_data = np.load(IVF_PQ_LAYOUT_PATH)
-        layout_prefix_global = layout_data["prefix"]
+        if not Path(IVF_PQ_LAYOUT_PATH).exists(): raise RuntimeError(f"IVF_PQ_LAYOUT_PATH file not found: {IVF_PQ_LAYOUT_PATH}")
+        def _load_layout_sync():
+            logging.info("Worker thread: Loading IVF-PQ layout...")
+            layout_data = np.load(IVF_PQ_LAYOUT_PATH)
+            logging.info("Worker thread: IVF-PQ layout loaded.")
+            return layout_data["prefix"]
+        layout_prefix_global = await asyncio.to_thread(_load_layout_sync)
         update_stage_status("layout", "completed", "IVF-PQ layout loaded")
         logging.info("IVF-PQ layout loaded.")
 
-        # Stage 6: LMDB
-        update_initialization_status(stage="lmdb", progress=70, message="Opening LMDB environment...")
+        # Stage 6: LMDB Open
+        update_initialization_status(stage="lmdb", progress=25, message="Opening LMDB environment...")
         update_stage_status("lmdb", "in_progress")
-        
-        if not Path(LMDB_META_PATH).exists():
-            raise RuntimeError(f"LMDB_META_PATH directory not found {LMDB_META_PATH}")
-        lmdb_env_global = lmdb.open(LMDB_META_PATH, readonly=True, lock=False, max_dbs=2, max_readers=200, readahead=True)
-        lmdb_metadata_db_global = lmdb_env_global.open_db(b'metadata')
+        if not Path(LMDB_META_PATH).exists(): raise RuntimeError(f"LMDB_META_PATH directory not found {LMDB_META_PATH}")
+        def _open_lmdb_sync():
+            logging.info("Worker thread: Opening LMDB environment...")
+            env = lmdb.open(LMDB_META_PATH, readonly=True, lock=False, max_dbs=2, max_readers=200, readahead=True)
+            db = env.open_db(b'metadata')
+            logging.info("Worker thread: LMDB environment opened.")
+            return env, db
+        lmdb_env_global, lmdb_metadata_db_global = await asyncio.to_thread(_open_lmdb_sync)
         update_stage_status("lmdb", "completed", "LMDB environment opened")
         logging.info("LMDB environment opened.")
 
-        # Stage 7: Thread Pool
-        update_initialization_status(stage="thread_pool", progress=80, message="Initializing thread pool...")
-        update_stage_status("thread_pool", "in_progress")
+        # --- Parallel Part: Embeddings (Stage 4) and LMDB Page Warmup ---
+        update_initialization_status(stage="parallel_heavy_loading", progress=30, 
+                                     message="Concurrently: Loading embeddings & Warming LMDB pages...")
+
+        # Embedding loading helpers (defined here to capture total_embeddings)
+        embedding_size_gb = (total_embeddings * VECTOR_DIM * 2) / (1024**3)
+        def _load_embeddings_to_ram_sync():
+            logging.info(f"Worker thread (Embeddings): Loading into RAM (~{embedding_size_gb:.1f} GB)...")
+            mmap_view = np.memmap(EMBEDDINGS_PATH, dtype=np.float16, mode="r", shape=(total_embeddings, VECTOR_DIM))
+            embeddings_ram = mmap_view.copy(order="C")
+            mmap_view._mmap.close()
+            del mmap_view
+            logging.info(f"Worker thread (Embeddings): Loaded into RAM.")
+            return embeddings_ram
+
+        def _memmap_embeddings_sync():
+            logging.info(f"Worker thread (Embeddings): Memory-mapping (~{embedding_size_gb:.1f} GB)...")
+            emb = np.memmap(EMBEDDINGS_PATH, dtype=np.float16, mode="r", shape=(total_embeddings, VECTOR_DIM))
+            logging.info(f"Worker thread (Embeddings): Memory-mapped.")
+            return emb
+
+        # LMDB page warmup helper (already defined, uses lmdb_env_global from above)
+        def _initialize_lmdb_page_warmup_sync(): # Already defined from previous step
+            logging.info("Initialization (thread LMDB Warmup): Touching LMDB pages...")
+            count = 0
+            try:
+                with lmdb_env_global.begin(db=lmdb_metadata_db_global, buffers=True) as txn_touch:
+                    cur_touch = txn_touch.cursor()
+                    for _ in cur_touch:
+                        count += 1
+                        if count % 5_000_000 == 0:
+                            logging.info(f"Initialization (thread LMDB Warmup): Touched {count:,} LMDB records...")
+            except Exception as e_lmdb_touch:
+                logging.error(f"Initialization (thread LMDB Warmup): Error during page touching: {e_lmdb_touch}", exc_info=True)
+            logging.info(f"Initialization (thread LMDB Warmup): Finished touching {count:,} LMDB records")
+            return count
+
+        # Create tasks for parallel execution
+        tasks_to_run_in_parallel = []
+
+        update_stage_status("embeddings", "in_progress", f"Loading embeddings ({embedding_size_gb:.1f} GB)... ")
+        if not Path(EMBEDDINGS_PATH).exists(): raise RuntimeError(f"Embeddings file not found: {EMBEDDINGS_PATH}")
+        if LOAD_EMBEDDINGS_TO_RAM:
+            task_embeddings = asyncio.create_task(asyncio.to_thread(_load_embeddings_to_ram_sync), name="load_embeddings_ram")
+        else:
+            task_embeddings = asyncio.create_task(asyncio.to_thread(_memmap_embeddings_sync), name="memmap_embeddings")
+        tasks_to_run_in_parallel.append(task_embeddings)
+
+        update_stage_status("lmdb_page_warmup", "in_progress", "Warming up LMDB pages...")
+        task_lmdb_warmup = asyncio.create_task(asyncio.to_thread(_initialize_lmdb_page_warmup_sync), name="lmdb_page_warmup")
+        tasks_to_run_in_parallel.append(task_lmdb_warmup)
         
+        logging.info(f"Starting parallel execution of: {', '.join(t.get_name() for t in tasks_to_run_in_parallel)}")
+        results = await asyncio.gather(*tasks_to_run_in_parallel, return_exceptions=True)
+        logging.info("Parallel loading/warming tasks completed.")
+
+        # Process results (Embeddings is first in tasks_to_run_in_parallel)
+        embeddings_result = results[0]
+        if isinstance(embeddings_result, Exception):
+            logging.error(f"Failed to load/memmap embeddings: {embeddings_result}", exc_info=embeddings_result)
+            raise RuntimeError(f"Failed to load/memmap embeddings: {embeddings_result}")
+        embeddings_global = embeddings_result
+        if LOAD_EMBEDDINGS_TO_RAM:
+            update_stage_status("embeddings", "completed", f"Embeddings loaded into RAM ({embedding_size_gb:.1f} GB)")
+        else:
+            update_stage_status("embeddings", "completed", f"Embeddings memmap loaded ({embedding_size_gb:.1f} GB)")
+        
+        # Process LMDB warmup result (second in tasks_to_run_in_parallel)
+        lmdb_warmup_result = results[1]
+        if isinstance(lmdb_warmup_result, Exception):
+            # This might not be fatal for server startup, log error and continue, or raise if critical
+            logging.error(f"LMDB page warmup failed or encountered an error: {lmdb_warmup_result}", exc_info=lmdb_warmup_result)
+            update_stage_status("lmdb_page_warmup", "error", f"LMDB page warmup error: {lmdb_warmup_result}")
+            # Decide if this is a fatal error. For now, we'll allow server to continue.
+        else:
+            update_stage_status("lmdb_page_warmup", "completed", "LMDB page warmup finished")
+        logging.info("LMDB page warmup processing finished.") # General log regardless of outcome
+        
+        # --- Sequential Part 2 ---
+        update_initialization_status(stage="thread_pool", progress=85, message="Initializing thread pool...") # Adjusted progress
+        update_stage_status("thread_pool", "in_progress")
         thread_pool_global = ThreadPoolExecutor(max_workers=8, thread_name_prefix="vector_fetch")
         update_stage_status("thread_pool", "completed", "Thread pool initialized")
         logging.info("Thread pool initialized for vector retrieval.")
 
-        # Stage 8: Warmup
-        update_initialization_status(stage="warmup", progress=90, message="Running warmup queries...")
-        update_stage_status("warmup", "in_progress")
-        
-        await run_warmup()
-        update_stage_status("warmup", "completed", "Warmup queries completed")
+        update_initialization_status(stage="app_warmup", progress=90, message="Running application warmup queries...")
+        update_stage_status("app_warmup", "in_progress")
+        await run_warmup() # run_warmup (app_warmup) remains unchanged
+        update_stage_status("app_warmup", "completed", "Warmup queries completed")
 
-        # Completion
         total_time = time.perf_counter() - startup_timer_start
         update_initialization_status(stage="ready", progress=100, 
                                     message=f"Server ready! Initialization completed in {total_time:.1f}s", 
@@ -302,46 +362,67 @@ async def initialize_server_async():
 
     except Exception as e:
         error_msg = f"Initialization failed: {str(e)}"
-        update_initialization_status(error=error_msg)
+        update_initialization_status(error=error_msg, stage="error", progress=initialization_status.get("progress", 0))
         logging.error(f"Server initialization failed: {e}", exc_info=True)
 
 async def run_warmup():
     """Run warmup queries"""
     try:
         warmup_query_text = "Initialize server components"
-        response = cohere_client_global.embed(texts=[warmup_query_text], model='multilingual-22-12', input_type='search_query')
-        query_embedding_warmup = np.array(response.embeddings[0], dtype=np.float32)
+
+        # Cohere embed
+        def _warmup_cohere_embed_sync():
+            logging.info("AppWarmup (thread): Running Cohere embed...") # Changed log prefix
+            response = cohere_client_global.embed(texts=[warmup_query_text], model='multilingual-22-12', input_type='search_query')
+            logging.info("AppWarmup (thread): Cohere embed complete.")
+            return np.array(response.embeddings[0], dtype=np.float32)
+        query_embedding_warmup = await asyncio.to_thread(_warmup_cohere_embed_sync)
+        
         query_gpu_warmup = cp.asarray(query_embedding_warmup, dtype=cp.float32).reshape(1, VECTOR_DIM)
         
         search_params_warmup = ivf_pq.SearchParams(n_probes=N_PROBES_SEARCH)
-        _, candidates_pq_warmup = ivf_pq.search(search_params_warmup, index_global, query_gpu_warmup, OVERSAMPLE_K)
+        def _warmup_ivf_pq_search_sync():
+            logging.info("AppWarmup (thread): Running IVF-PQ search...") # Changed log prefix
+            distances, candidates = ivf_pq.search(search_params_warmup, index_global, query_gpu_warmup, OVERSAMPLE_K)
+            logging.info("AppWarmup (thread): IVF-PQ search complete.")
+            return distances, candidates
+        _, candidates_pq_warmup = await asyncio.to_thread(_warmup_ivf_pq_search_sync)
         
         if candidates_pq_warmup.shape[0] > 0 and candidates_pq_warmup.shape[1] > 0:
-            candidates_cpu_warmup = cp.asnumpy(candidates_pq_warmup)[0]
+            def _warmup_asnumpy_sync():
+                logging.info("AppWarmup (thread): Converting candidates to numpy...") # Changed log prefix
+                res = cp.asnumpy(candidates_pq_warmup)[0]
+                logging.info("AppWarmup (thread): Conversion to numpy complete.")
+                return res
+            candidates_cpu_warmup = await asyncio.to_thread(_warmup_asnumpy_sync)
+
             if candidates_cpu_warmup.size > 0:
                 valid_mask = (candidates_cpu_warmup >= 0) & (candidates_cpu_warmup < len(id_to_sorted_row_global))
                 valid_candidates_warmup = candidates_cpu_warmup[valid_mask]
 
                 if valid_candidates_warmup.size > 0:
-                    _ = get_vectors_server(valid_candidates_warmup, embeddings_global, id_to_sorted_row_global, layout_prefix_global)
-                    with lmdb_env_global.begin(db=lmdb_metadata_db_global, buffers=True) as txn_warmup:
-                        _ = get_metadata_lmdb_server(valid_candidates_warmup[:FINAL_K], txn_warmup, lmdb_metadata_db_global, id_to_sorted_row_global)
+                    def _warmup_get_vectors_sync():
+                        logging.info("AppWarmup (thread): Getting vectors...") # Changed log prefix
+                        vecs = get_vectors_server(valid_candidates_warmup, embeddings_global, id_to_sorted_row_global, layout_prefix_global)
+                        logging.info("AppWarmup (thread): Got vectors.")
+                        return vecs
+                    _ = await asyncio.to_thread(_warmup_get_vectors_sync)
 
-        # Touch LMDB pages
-        logging.info("Touching LMDB pages for warmup...")
-        with lmdb_env_global.begin(db=lmdb_metadata_db_global, buffers=True) as txn_touch:
-            cur_touch = txn_touch.cursor()
-            count = 0
-            for _ in cur_touch: 
-                count += 1
-                if count % 5_000_000 == 0:
-                    logging.info(f"Touched {count:,} LMDB records...")
-                    # Allow other tasks to run
-                    await asyncio.sleep(0.001)
-            logging.info(f"Finished touching {count:,} LMDB records")
+                    def _warmup_get_metadata_sync():
+                        logging.info("AppWarmup (thread): Getting metadata from LMDB...") # Changed log prefix
+                        with lmdb_env_global.begin(db=lmdb_metadata_db_global, buffers=True) as txn_warmup:
+                            meta = get_metadata_lmdb_server(valid_candidates_warmup[:FINAL_K], txn_warmup, lmdb_metadata_db_global, id_to_sorted_row_global)
+                        logging.info("AppWarmup (thread): Got metadata from LMDB.")
+                        return meta
+                    _ = await asyncio.to_thread(_warmup_get_metadata_sync)
+
+        # LMDB page touching logic has been removed from here
 
     except Exception as e:
-        logging.error(f"Error during warmup: {e}", exc_info=True)
+        # Renamed stage to app_warmup
+        logging.error(f"Error during application warmup (app_warmup): {e}", exc_info=True)
+        # Optionally re-raise or update status if app_warmup failure is critical
+        # For now, just log, as server might still be usable without full app warmup.
 
 @app.on_event("startup")
 async def startup_event():

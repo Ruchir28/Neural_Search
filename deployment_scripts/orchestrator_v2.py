@@ -11,6 +11,7 @@ from datetime import datetime, timedelta
 try:
     import boto3
     from fastapi import FastAPI
+    from fastapi.middleware.cors import CORSMiddleware
     import uvicorn
 except ImportError:
     print("ERROR: Required dependencies not installed. Install with: pip install boto3 fastapi uvicorn httpx")
@@ -36,6 +37,16 @@ class SemanticSearchOrchestrator:
         
         # Initialize FastAPI app
         self.app = FastAPI(title="Semantic Search Orchestrator")
+        
+        # Add CORS middleware to allow frontend access
+        self.app.add_middleware(
+            CORSMiddleware,
+            allow_origins=["*"],  # In production, replace with your frontend domain
+            allow_credentials=True,
+            allow_methods=["GET", "POST", "DELETE"],
+            allow_headers=["*"],
+        )
+        
         self._setup_routes()
         
         # Initialize AWS resources

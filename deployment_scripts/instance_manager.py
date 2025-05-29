@@ -197,12 +197,65 @@ yum install git curl -y --allowerasing
 # Mount EBS volume
 log "Setting up EBS volume mount..."
 mkdir -p /data
-while [ ! -e /dev/xvdf ]; do 
-    log "Waiting for EBS volume to be available..."
+
+# Ensure log file has proper permissions
+touch /var/log/semantic-search-setup.log
+chmod 644 /var/log/semantic-search-setup.log
+
+# Use volume ID to find the exact EBS device (more reliable than device name guessing)
+VOLUME_ID="{self.config.ebs_volume_id}"
+# Remove "vol-" prefix if present
+VOLUME_ID_CLEAN=${{VOLUME_ID#vol-}}
+
+log "Looking for EBS volume with ID: $VOLUME_ID_CLEAN"
+
+# Wait for EBS volume to be available and find it using volume ID
+max_attempts=24  # 2 minutes
+attempt=0
+ebs_device=""
+
+while [ $attempt -lt $max_attempts ]; do
+    # Find device using volume ID in /dev/disk/by-id/ (support both NVMe and SCSI)
+    DEV_NAME=$(ls /dev/disk/by-id/ 2>/dev/null \
+        | grep -x "nvme-Amazon_Elastic_Block_Store_vol${{VOLUME_ID_CLEAN}}" \
+        || ls /dev/disk/by-id/ 2>/dev/null \
+        | grep -x "scsi-0Amazon_Elastic_Block_Store_vol${{VOLUME_ID_CLEAN}}" \
+        || true)
+    
+    if [ -n "$DEV_NAME" ]; then
+        ebs_device="/dev/disk/by-id/$DEV_NAME"
+        log "Found EBS volume at: $ebs_device"
+        break
+    fi
+    
+    log "Waiting for EBS volume to be available... (attempt $((attempt + 1))/$max_attempts)"
     sleep 5
+    attempt=$((attempt + 1))
 done
-mount /dev/xvdf /data
-log "EBS volume mounted successfully"
+
+if [ -z "$ebs_device" ]; then
+    log "ERROR: EBS volume with ID $VOLUME_ID_CLEAN not found after waiting"
+    echo "Setup failed: EBS volume not found" > /tmp/setup_failed
+    exit 1
+fi
+
+# Check if /data is already mounted to avoid double-mounting
+if mountpoint -q /data; then
+    log "EBS volume already mounted at /data"
+else
+    # Mount the EBS volume
+    log "Mounting EBS volume from $ebs_device to /data..."
+    if ! mount -t ext4 "$ebs_device" /data; then
+        log "ERROR: Failed to mount EBS volume"
+        echo "Setup failed: EBS volume mount failed" > /tmp/setup_failed
+        exit 1
+    fi
+    log "EBS volume mounted successfully"
+fi
+
+# Verify mount and show some info
+log "EBS volume mount verification:"
+df -h /data | tee -a /var/log/semantic-search-setup.log
 
 # Verify critical data files exist
 log "Verifying data files on EBS volume..."
@@ -226,7 +279,7 @@ log "All required data files verified"
 # Clone repository and setup
 log "Cloning repository..."
 cd /home/ec2-user
-if ! git clone https://github.com/Ruchir28/Neural_Search.git; then
+if ! sudo -u ec2-user git clone https://github.com/Ruchir28/Neural_Search.git; then
     log "ERROR: Failed to clone repository"
     echo "Setup failed: Repository clone failed" > /tmp/setup_failed
     exit 1
@@ -248,7 +301,7 @@ log "PyTorch environment activated: $CONDA_DEFAULT_ENV"
 
 # Install Python dependencies with error checking
 log "Installing Python dependencies..."
-if ! pip install -r requirements.txt; then
+if ! pip install --no-cache-dir -r requirements.txt; then
     log "ERROR: Failed to install Python dependencies"
     echo "Setup failed: Pip install failed" > /tmp/setup_failed
     exit 1
@@ -281,17 +334,19 @@ EOF
 export DATA_DIR="/data"
 export COHERE_API_KEY="{self.config.cohere_api_key}"
 export LOAD_EMBEDDINGS_TO_RAM="{self.config.load_embeddings_to_ram}"
-echo 'export DATA_DIR="/data"' >> /home/ec2-user/.bashrc
-echo 'export COHERE_API_KEY="{self.config.cohere_api_key}"' >> /home/ec2-user/.bashrc
-echo 'export LOAD_EMBEDDINGS_TO_RAM="{self.config.load_embeddings_to_ram}"' >> /home/ec2-user/.bashrc
+
+# Add environment variables to ec2-user's bashrc (ensure proper ownership)
+sudo -u ec2-user bash -c 'echo "export DATA_DIR=\"/data\"" >> /home/ec2-user/.bashrc'
+sudo -u ec2-user bash -c 'echo "export COHERE_API_KEY=\"{self.config.cohere_api_key}\"" >> /home/ec2-user/.bashrc'
+sudo -u ec2-user bash -c 'echo "export LOAD_EMBEDDINGS_TO_RAM=\"{self.config.load_embeddings_to_ram}\"" >> /home/ec2-user/.bashrc'
 
 # Ensure the conda environment is activated for future sessions
-echo 'source /opt/miniconda3/bin/activate pytorch' >> /home/ec2-user/.bashrc
+sudo -u ec2-user bash -c 'echo "source /opt/miniconda3/bin/activate pytorch" >> /home/ec2-user/.bashrc'
 
 # Start the semantic search server with data paths pointing to EBS volume
 log "Starting semantic search server..."
-# Use the conda environment's Python and set environment variables
-DATA_DIR="/data" COHERE_API_KEY="{self.config.cohere_api_key}" LOAD_EMBEDDINGS_TO_RAM="{self.config.load_embeddings_to_ram}" nohup /opt/miniconda3/envs/pytorch/bin/python server.py > server.log 2>&1 &
+# Run the server as ec2-user for proper permissions
+sudo -u ec2-user bash -c 'cd /home/ec2-user/Neural_Search && source /opt/miniconda3/bin/activate pytorch && DATA_DIR="/data" COHERE_API_KEY="{self.config.cohere_api_key}" LOAD_EMBEDDINGS_TO_RAM="{self.config.load_embeddings_to_ram}" nohup /opt/miniconda3/envs/pytorch/bin/python server.py > server.log 2>&1 &'
 
 # Wait for server to be ready with timeout
 log "Waiting for server to be ready..."
@@ -431,16 +486,24 @@ log "Semantic search server setup completed successfully"
         except Exception as e:
             raise ValueError(f"Failed to terminate instance: {str(e)}")
     
-    def cleanup_failed_instances(self):
-        """Remove failed instances from tracking"""
+    async def cleanup_failed_instances(self):
+        """Properly terminate failed instances instead of just removing them from tracking"""
         failed_instances = [
             instance_id for instance_id, instance in self.instances.items()
             if instance.status == InstanceStatus.FAILED
         ]
         
         for instance_id in failed_instances:
-            print(f"Removing failed instance {instance_id} from tracking")
-            del self.instances[instance_id]
+            print(f"Terminating failed instance {instance_id} (will detach EBS volume and terminate EC2 instance)")
+            try:
+                await self.terminate_instance(instance_id)
+                print(f"✓ Successfully terminated failed instance {instance_id}")
+            except Exception as e:
+                print(f"✗ Failed to terminate failed instance {instance_id}: {e}")
+                # Still remove from tracking even if termination failed to avoid infinite loops
+                if instance_id in self.instances:
+                    del self.instances[instance_id]
+                    print(f"Removed {instance_id} from tracking despite termination failure")
     
     def get_idle_instances(self) -> List[ManagedInstance]:
         """Get list of ready instances that are not processing requests, sorted by last used time"""

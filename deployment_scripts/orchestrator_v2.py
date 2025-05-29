@@ -102,7 +102,7 @@ class SemanticSearchOrchestrator:
             current_time = datetime.now()
             
             # Clean up failed instances
-            self.instance_manager.cleanup_failed_instances()
+            await self.instance_manager.cleanup_failed_instances()
             
             # Terminate instances that have been running for 30+ minutes (1800 seconds)
             max_runtime = self.config.instance_max_runtime

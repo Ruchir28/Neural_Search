@@ -179,12 +179,45 @@ class AWSManager:
             raise
     
     def launch_instance(self, user_data: str) -> Dict[str, Any]:
-        """Launch a new EC2 instance"""
+        """Launch a new EC2 instance, trying multiple instance types if needed"""
+        
+        # Try each instance type in order until one succeeds
+        last_error = None
+        for i, instance_type in enumerate(self.config.ec2_instance_types):
+            try:
+                print(f"Attempting to launch {instance_type} (attempt {i+1}/{len(self.config.ec2_instance_types)})...")
+                return self._launch_instance_with_type(instance_type, user_data)
+            except ClientError as e:
+                error_code = e.response['Error']['Code']
+                error_message = e.response['Error']['Message']
+                
+                # Check if this is a capacity/availability error
+                if error_code in ['InsufficientInstanceCapacity', 'InstanceLimitExceeded', 'Unsupported']:
+                    print(f"✗ {instance_type} not available: {error_message}")
+                    last_error = e
+                    continue
+                else:
+                    # For other errors (permissions, invalid params, etc.), don't retry
+                    print(f"✗ Failed to launch {instance_type}: {error_message}")
+                    raise
+            except Exception as e:
+                print(f"✗ Unexpected error launching {instance_type}: {e}")
+                last_error = e
+                continue
+        
+        # If we get here, all instance types failed
+        if last_error:
+            raise RuntimeError(f"Failed to launch any instance type. Tried: {', '.join(self.config.ec2_instance_types)}. Last error: {last_error}")
+        else:
+            raise RuntimeError(f"Failed to launch any instance type. Tried: {', '.join(self.config.ec2_instance_types)}")
+    
+    def _launch_instance_with_type(self, instance_type: str, user_data: str) -> Dict[str, Any]:
+        """Launch an EC2 instance with a specific instance type"""
         launch_params = {
             'ImageId': self.config.ec2_ami_id,
             'MinCount': 1,
             'MaxCount': 1,
-            'InstanceType': self.config.ec2_instance_type,
+            'InstanceType': instance_type,
             'SecurityGroupIds': [self.security_group_id],
             'SubnetId': self.target_subnet_id,
             'UserData': user_data,
@@ -195,7 +228,8 @@ class AWSManager:
                         {'Key': 'Name', 'Value': f'semantic-search-{datetime.now().strftime("%Y%m%d-%H%M%S")}'},
                         {'Key': 'Service', 'Value': 'semantic-search'},
                         {'Key': 'ManagedBy', 'Value': 'orchestrator'},
-                        {'Key': 'EBSVolumeId', 'Value': self.config.ebs_volume_id}
+                        {'Key': 'EBSVolumeId', 'Value': self.config.ebs_volume_id},
+                        {'Key': 'InstanceType', 'Value': instance_type}
                     ]
                 }
             ]
@@ -205,26 +239,22 @@ class AWSManager:
         if self.config.ec2_key_pair:
             launch_params['KeyName'] = self.config.ec2_key_pair
         
-        # Configure spot instances if enabled
+        # Handle spot instances
         if self.config.use_spot_instances:
-            instance_market_options = {
-                'MarketType': 'spot',
-                'SpotOptions': {
-                    'SpotInstanceType': 'one-time'
-                }
+            spot_spec = {
+                'SpotPrice': self.config.spot_max_price or '',  # Empty string means current spot price
+                'Type': 'one-time'
             }
-            
-            # Add max price if specified
-            if self.config.spot_max_price:
-                instance_market_options['SpotOptions']['MaxPrice'] = self.config.spot_max_price
-            
-            launch_params['InstanceMarketOptions'] = instance_market_options
-            print(f"Launching spot instance with market options: {instance_market_options}")
-        else:
-            print("Launching on-demand instance")
+            launch_params['InstanceMarketOptions'] = {
+                'MarketType': 'spot',
+                'SpotOptions': spot_spec
+            }
         
         response = self.ec2_client.run_instances(**launch_params)
-        return response['Instances'][0]
+        instance_data = response['Instances'][0]
+        
+        print(f"✓ Successfully launched {instance_type}: {instance_data['InstanceId']}")
+        return instance_data
     
     def wait_for_instance_running(self, instance_id: str):
         """Wait for instance to be in running state"""

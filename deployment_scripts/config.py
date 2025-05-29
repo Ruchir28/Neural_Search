@@ -3,7 +3,7 @@ Configuration management for the semantic search orchestrator
 """
 import os
 from dataclasses import dataclass
-from typing import Optional
+from typing import Optional, List
 
 @dataclass
 class OrchestratorConfig:
@@ -12,7 +12,7 @@ class OrchestratorConfig:
     # AWS Configuration
     aws_region: str
     ebs_volume_id: str
-    ec2_instance_type: str
+    ec2_instance_types: List[str]
     ec2_ami_id: str
     ec2_key_pair: Optional[str]
     ec2_security_group: str
@@ -42,11 +42,18 @@ class OrchestratorConfig:
         if not cohere_api_key:
             raise ValueError("COHERE_API_KEY environment variable is required")
         
+        # Parse instance types - support both single type and comma-separated list
+        instance_types_str = os.getenv("EC2_INSTANCE_TYPES", os.getenv("EC2_INSTANCE_TYPE", "g4dn.4xlarge"))
+        ec2_instance_types = [t.strip() for t in instance_types_str.split(",") if t.strip()]
+        
+        if not ec2_instance_types:
+            raise ValueError("At least one EC2 instance type must be specified")
+        
         return cls(
             # AWS Configuration
             aws_region=os.getenv("AWS_REGION", "us-east-1"),
             ebs_volume_id=ebs_volume_id,
-            ec2_instance_type=os.getenv("EC2_INSTANCE_TYPE", "g4dn.4xlarge"),
+            ec2_instance_types=ec2_instance_types,
             ec2_ami_id=os.getenv("EC2_AMI_ID", "ami-074d9c327b5296aaa"),
             ec2_key_pair=os.getenv("EC2_KEY_PAIR"),
             ec2_security_group=os.getenv("EC2_SECURITY_GROUP", "semantic-search-sg"),

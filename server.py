@@ -15,6 +15,8 @@ import os
 from typing import Any
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dotenv import load_dotenv
+import asyncio
+import threading
 
 # Load environment variables from config.env file
 load_dotenv('config.env')
@@ -36,6 +38,7 @@ N_PROBES_SEARCH = 40
 COHERE_API_KEY = os.getenv("COHERE_API_KEY")
 VECTOR_DIM = 768  
 
+# Global variables for components
 index_global = None
 cohere_client_global = None
 embeddings_global = None
@@ -44,6 +47,27 @@ id_to_sorted_row_global = None
 lmdb_env_global = None
 lmdb_metadata_db_global = None
 thread_pool_global = None
+
+# Global variables for initialization tracking
+initialization_status = {
+    "stage": "starting",
+    "progress": 0,
+    "message": "Server starting up...",
+    "error": None,
+    "ready": False,
+    "start_time": None,
+    "stages": {
+        "cohere_client": {"status": "pending", "message": "Initializing Cohere client"},
+        "id_mapping": {"status": "pending", "message": "Loading ID to sorted row mapping"},
+        "index": {"status": "pending", "message": "Loading IVF-PQ index"},
+        "embeddings": {"status": "pending", "message": "Loading embeddings"},
+        "layout": {"status": "pending", "message": "Loading IVF-PQ layout"},
+        "lmdb": {"status": "pending", "message": "Opening LMDB environment"},
+        "thread_pool": {"status": "pending", "message": "Initializing thread pool"},
+        "warmup": {"status": "pending", "message": "Running warmup queries"}
+    }
+}
+initialization_lock = threading.Lock()
 
 logging.basicConfig(
     filename='server_query.log',
@@ -201,158 +225,185 @@ def get_metadata_lmdb_server(original_vector_ids: np.ndarray, txn: lmdb.Transact
 
     return results_in_original_order, total_get_time, total_decode_time
 
-@app.on_event("startup")
-async def startup_event():
+def update_initialization_status(stage: str = None, progress: int = None, message: str = None, error: str = None, ready: bool = None):
+    """Update the global initialization status"""
+    with initialization_lock:
+        if stage:
+            initialization_status["stage"] = stage
+        if progress is not None:
+            initialization_status["progress"] = progress
+        if message:
+            initialization_status["message"] = message
+        if error:
+            initialization_status["error"] = error
+        if ready is not None:
+            initialization_status["ready"] = ready
+
+def update_stage_status(stage_name: str, status: str, message: str = None):
+    """Update the status of a specific initialization stage"""
+    with initialization_lock:
+        if stage_name in initialization_status["stages"]:
+            initialization_status["stages"][stage_name]["status"] = status
+            if message:
+                initialization_status["stages"][stage_name]["message"] = message
+
+async def initialize_server_async():
+    """Asynchronous server initialization that runs in background"""
     global index_global, cohere_client_global, embeddings_global, layout_prefix_global, \
            id_to_sorted_row_global, lmdb_env_global, lmdb_metadata_db_global, thread_pool_global
 
-    logging.info("Server starting up...")
-    startup_timer_start = time.perf_counter()
+    try:
+        initialization_status["start_time"] = time.time()
+        logging.info("Starting asynchronous server initialization...")
+        startup_timer_start = time.perf_counter()
 
-    if not COHERE_API_KEY:
-        logging.error("COHERE_API_KEY not set. Please set the environment variable.")
-        raise RuntimeError("COHERE_API_KEY not configured.")
-    cohere_client_global = cohere.Client(COHERE_API_KEY)
-    logging.info("Cohere client initialized.")
-
-    # --- Load ID to sorted row map first (needed for total_embeddings and other loads) ---
-    if not Path(ID_TO_SORTED_ROW_PATH).exists():
-        logging.error(f"ID_TO_SORTED_ROW_PATH file not found: {ID_TO_SORTED_ROW_PATH}")
-        raise RuntimeError(f"ID_TO_SORTED_ROW_PATH file not found: {ID_TO_SORTED_ROW_PATH}")
-    id_to_sorted_row_global = np.load(ID_TO_SORTED_ROW_PATH, mmap_mode="r")
-    total_embeddings = len(id_to_sorted_row_global)
-    logging.info(f"ID to sorted row map loaded. Total items: {total_embeddings}")
-
-    # --- Load IVF-PQ index ---
-    if not INDEX_PATH.exists():
-        logging.error(f"Index file not found: {INDEX_PATH}")
-        raise RuntimeError(f"Index file not found: {INDEX_PATH}")
-    index_global = ivf_pq.load(str(INDEX_PATH))
-    logging.info("IVF-PQ index loaded.")
-
-    # --- Load embeddings (RAM vs memory-mapped) ---
-    if not Path(EMBEDDINGS_PATH).exists():
-        logging.error(f"Embeddings file not found: {EMBEDDINGS_PATH}")
-        raise RuntimeError(f"Embeddings file not found: {EMBEDDINGS_PATH}")
-    
-    # Calculate memory requirements
-    embedding_size_gb = (total_embeddings * VECTOR_DIM * 2) / (1024**3)  # 2 bytes per float16
-    
-    if LOAD_EMBEDDINGS_TO_RAM:
-        logging.info(f"Loading embeddings into RAM (requires ~{embedding_size_gb:.1f} GB)...")
-        logging.warning(f"This will consume {embedding_size_gb:.1f} GB of system RAM!")
+        # Stage 1: Cohere Client
+        update_initialization_status(stage="cohere_client", progress=10, message="Initializing Cohere client...")
+        update_stage_status("cohere_client", "in_progress")
         
-        # Load embeddings entirely into RAM for maximum performance
-        embeddings_mmap = np.memmap(EMBEDDINGS_PATH, dtype=np.float16, mode="r", shape=(total_embeddings, VECTOR_DIM))
-        embeddings_global = np.array(embeddings_mmap, dtype=np.float16)  # Copy to RAM
-        del embeddings_mmap  # Free the memmap reference
+        if not COHERE_API_KEY:
+            raise RuntimeError("COHERE_API_KEY not configured.")
+        cohere_client_global = cohere.Client(COHERE_API_KEY)
+        update_stage_status("cohere_client", "completed", "Cohere client initialized")
+        logging.info("Cohere client initialized.")
+
+        # Stage 2: ID Mapping
+        update_initialization_status(stage="id_mapping", progress=20, message="Loading ID to sorted row mapping...")
+        update_stage_status("id_mapping", "in_progress")
         
-        logging.info(f"Embeddings loaded into RAM ({embedding_size_gb:.1f} GB). Maximum performance mode enabled.")
-    else:
-        logging.info(f"Using memory-mapped embeddings (file size: ~{embedding_size_gb:.1f} GB)")
-        logging.info("For better performance on systems with sufficient RAM, set LOAD_EMBEDDINGS_TO_RAM=true")
+        if not Path(ID_TO_SORTED_ROW_PATH).exists():
+            raise RuntimeError(f"ID_TO_SORTED_ROW_PATH file not found: {ID_TO_SORTED_ROW_PATH}")
+        id_to_sorted_row_global = np.load(ID_TO_SORTED_ROW_PATH, mmap_mode="r")
+        total_embeddings = len(id_to_sorted_row_global)
+        update_stage_status("id_mapping", "completed", f"ID mapping loaded. Total items: {total_embeddings:,}")
+        logging.info(f"ID to sorted row map loaded. Total items: {total_embeddings}")
+
+        # Stage 3: Index
+        update_initialization_status(stage="index", progress=30, message="Loading IVF-PQ index...")
+        update_stage_status("index", "in_progress")
         
-        # Use memory-mapped file (lazy loading, lower memory usage)
-        embeddings_global = np.memmap(EMBEDDINGS_PATH, dtype=np.float16, mode="r", shape=(total_embeddings, VECTOR_DIM))
+        if not INDEX_PATH.exists():
+            raise RuntimeError(f"Index file not found: {INDEX_PATH}")
+        index_global = ivf_pq.load(str(INDEX_PATH))
+        update_stage_status("index", "completed", "IVF-PQ index loaded")
+        logging.info("IVF-PQ index loaded.")
+
+        # Stage 4: Embeddings (this is the longest stage)
+        embedding_size_gb = (total_embeddings * VECTOR_DIM * 2) / (1024**3)
+        update_initialization_status(stage="embeddings", progress=40, 
+                                    message=f"Loading embeddings ({embedding_size_gb:.1f} GB)...")
+        update_stage_status("embeddings", "in_progress")
         
-        logging.info("Embeddings memmap loaded (memory-efficient mode).")
+        if not Path(EMBEDDINGS_PATH).exists():
+            raise RuntimeError(f"Embeddings file not found: {EMBEDDINGS_PATH}")
+        
+        if LOAD_EMBEDDINGS_TO_RAM:
+            update_stage_status("embeddings", "in_progress", f"Loading {embedding_size_gb:.1f} GB into RAM...")
+            logging.info(f"Loading embeddings into RAM (requires ~{embedding_size_gb:.1f} GB)...")
+            
+            embeddings_mmap = np.memmap(EMBEDDINGS_PATH, dtype=np.float16, mode="r", shape=(total_embeddings, VECTOR_DIM))
+            embeddings_global = np.array(embeddings_mmap, dtype=np.float16)
+            del embeddings_mmap
+            
+            update_stage_status("embeddings", "completed", f"Embeddings loaded into RAM ({embedding_size_gb:.1f} GB)")
+            logging.info(f"Embeddings loaded into RAM ({embedding_size_gb:.1f} GB). Maximum performance mode enabled.")
+        else:
+            embeddings_global = np.memmap(EMBEDDINGS_PATH, dtype=np.float16, mode="r", shape=(total_embeddings, VECTOR_DIM))
+            update_stage_status("embeddings", "completed", f"Embeddings memmap loaded ({embedding_size_gb:.1f} GB)")
+            logging.info("Embeddings memmap loaded (memory-efficient mode).")
 
-    # --- Load IVF-PQ layout (prefix for get_vectors_server) ---
-    if not Path(IVF_PQ_LAYOUT_PATH).exists():
-        logging.error(f"IVF_PQ_LAYOUT_PATH file not found: {IVF_PQ_LAYOUT_PATH}")
-        raise RuntimeError(f"IVF_PQ_LAYOUT_PATH file not found: {IVF_PQ_LAYOUT_PATH}")
-    layout_data = np.load(IVF_PQ_LAYOUT_PATH)
-    layout_prefix_global = layout_data["prefix"] # Contains cumulative sums of list sizes
-    logging.info("IVF-PQ layout loaded.")
+        # Stage 5: Layout
+        update_initialization_status(stage="layout", progress=60, message="Loading IVF-PQ layout...")
+        update_stage_status("layout", "in_progress")
+        
+        if not Path(IVF_PQ_LAYOUT_PATH).exists():
+            raise RuntimeError(f"IVF_PQ_LAYOUT_PATH file not found: {IVF_PQ_LAYOUT_PATH}")
+        layout_data = np.load(IVF_PQ_LAYOUT_PATH)
+        layout_prefix_global = layout_data["prefix"]
+        update_stage_status("layout", "completed", "IVF-PQ layout loaded")
+        logging.info("IVF-PQ layout loaded.")
 
-    # --- Open LMDB environment ---
-    if not Path(LMDB_META_PATH).exists(): # LMDB_META_PATH is a directory
-        logging.error(f"LMDB_META_PATH directory not found: {LMDB_META_PATH}")
-        raise RuntimeError(f"LMDB_META_PATH directory not found {LMDB_META_PATH}")
-    lmdb_env_global = lmdb.open(LMDB_META_PATH, readonly=True, lock=False, max_dbs=2, max_readers=200, readahead=True) # readahead=False for mmap
-    lmdb_metadata_db_global = lmdb_env_global.open_db(b'metadata')
-    logging.info("LMDB environment opened.")
+        # Stage 6: LMDB
+        update_initialization_status(stage="lmdb", progress=70, message="Opening LMDB environment...")
+        update_stage_status("lmdb", "in_progress")
+        
+        if not Path(LMDB_META_PATH).exists():
+            raise RuntimeError(f"LMDB_META_PATH directory not found {LMDB_META_PATH}")
+        lmdb_env_global = lmdb.open(LMDB_META_PATH, readonly=True, lock=False, max_dbs=2, max_readers=200, readahead=True)
+        lmdb_metadata_db_global = lmdb_env_global.open_db(b'metadata')
+        update_stage_status("lmdb", "completed", "LMDB environment opened")
+        logging.info("LMDB environment opened.")
 
-    # --- Initialize thread pool for vector retrieval ---
-    thread_pool_global = ThreadPoolExecutor(max_workers=8, thread_name_prefix="vector_fetch")
-    logging.info("Thread pool initialized for vector retrieval.")
+        # Stage 7: Thread Pool
+        update_initialization_status(stage="thread_pool", progress=80, message="Initializing thread pool...")
+        update_stage_status("thread_pool", "in_progress")
+        
+        thread_pool_global = ThreadPoolExecutor(max_workers=8, thread_name_prefix="vector_fetch")
+        update_stage_status("thread_pool", "completed", "Thread pool initialized")
+        logging.info("Thread pool initialized for vector retrieval.")
 
-    # --- Warmup ---
-    logging.info("Running warmup query...")
+        # Stage 8: Warmup
+        update_initialization_status(stage="warmup", progress=90, message="Running warmup queries...")
+        update_stage_status("warmup", "in_progress")
+        
+        await run_warmup()
+        update_stage_status("warmup", "completed", "Warmup queries completed")
+
+        # Completion
+        total_time = time.perf_counter() - startup_timer_start
+        update_initialization_status(stage="ready", progress=100, 
+                                    message=f"Server ready! Initialization completed in {total_time:.1f}s", 
+                                    ready=True)
+        logging.info(f"Server startup completed. Total time: {total_time:.4f} seconds")
+
+    except Exception as e:
+        error_msg = f"Initialization failed: {str(e)}"
+        update_initialization_status(error=error_msg)
+        logging.error(f"Server initialization failed: {e}", exc_info=True)
+
+async def run_warmup():
+    """Run warmup queries"""
     try:
         warmup_query_text = "Initialize server components"
-        # Ensure cohere_client_global is used, not co
         response = cohere_client_global.embed(texts=[warmup_query_text], model='multilingual-22-12', input_type='search_query')
         query_embedding_warmup = np.array(response.embeddings[0], dtype=np.float32)
         query_gpu_warmup = cp.asarray(query_embedding_warmup, dtype=cp.float32).reshape(1, VECTOR_DIM)
         
         search_params_warmup = ivf_pq.SearchParams(n_probes=N_PROBES_SEARCH)
-        # Ensure index_global is used
         _, candidates_pq_warmup = ivf_pq.search(search_params_warmup, index_global, query_gpu_warmup, OVERSAMPLE_K)
         
-        # Check if candidates_pq_warmup has valid dimensions before trying to access [0]
         if candidates_pq_warmup.shape[0] > 0 and candidates_pq_warmup.shape[1] > 0:
             candidates_cpu_warmup = cp.asnumpy(candidates_pq_warmup)[0]
             if candidates_cpu_warmup.size > 0:
-                # Filter for valid candidates before further processing
                 valid_mask = (candidates_cpu_warmup >= 0) & (candidates_cpu_warmup < len(id_to_sorted_row_global))
                 valid_candidates_warmup = candidates_cpu_warmup[valid_mask]
 
                 if valid_candidates_warmup.size > 0:
-                    # Ensure all global variables are used for helper functions
                     _ = get_vectors_server(valid_candidates_warmup, embeddings_global, id_to_sorted_row_global, layout_prefix_global)
                     with lmdb_env_global.begin(db=lmdb_metadata_db_global, buffers=True) as txn_warmup:
                         _ = get_metadata_lmdb_server(valid_candidates_warmup[:FINAL_K], txn_warmup, lmdb_metadata_db_global, id_to_sorted_row_global)
-                    logging.info("Warmup vector fetch and LMDB access successful.")
-                else:
-                    logging.warning("Warmup query: No valid candidates after filtering.")
-            else:
-                logging.warning("Warmup query: No candidates from IVF-PQ search (after asnumpy).")
-        else:
-            logging.warning("Warmup query: IVF-PQ search returned empty or unexpectedly shaped tensor.")
 
         # Touch LMDB pages
-        logging.info("[WARMUP_LMD_TOUCH] Attempting to touch LMDB pages...")
-        try:
-            with lmdb_env_global.begin(db=lmdb_metadata_db_global, buffers=True) as txn_touch:
-                logging.info("[WARMUP_LMD_TOUCH] Transaction for page touching started.")
-                cur_touch = txn_touch.cursor()
-                logging.info("[WARMUP_LMD_TOUCH] Cursor created. Starting iteration...")
-                count = 0
-                iter_start_time = time.perf_counter()
-                for _ in cur_touch: 
-                    count += 1
-                    if count % 5_000_000 == 0: # Log progress every 5 million records
-                        logging.info(f"[WARMUP_LMD_TOUCH] Iterated over {count} records...")
-                iter_end_time = time.perf_counter()
-                logging.info(f"[WARMUP_LMD_TOUCH] Finished iterating over {count} records. Time taken: {iter_end_time - iter_start_time:.2f}s")
-            logging.info("LMDB pages touched (warmup).") # This is the original success log for this step
-        except Exception as e_touch:
-            logging.error(f"[WARMUP_LMD_TOUCH] Error during LMDB page touching: {e_touch}", exc_info=True)
-            # Re-raise or handle as needed; for now, just logging it within the warmup try-block context
+        logging.info("Touching LMDB pages for warmup...")
+        with lmdb_env_global.begin(db=lmdb_metadata_db_global, buffers=True) as txn_touch:
+            cur_touch = txn_touch.cursor()
+            count = 0
+            for _ in cur_touch: 
+                count += 1
+                if count % 5_000_000 == 0:
+                    logging.info(f"Touched {count:,} LMDB records...")
+                    # Allow other tasks to run
+                    await asyncio.sleep(0.001)
+            logging.info(f"Finished touching {count:,} LMDB records")
 
     except Exception as e:
         logging.error(f"Error during warmup: {e}", exc_info=True)
-        # Don't raise here, allow server to start if possible, but log failure.
 
-    # Touch embeddings pages to pre-load into memory (only for memory-mapped files)
-    if not LOAD_EMBEDDINGS_TO_RAM:
-        logging.info("Pre-loading embeddings memmap into memory...")
-        touch_start_time = time.perf_counter()
-
-        for i in range(0, total_embeddings, 1000000):
-            start_idx = i
-            end_idx = min(start_idx + 1000000, total_embeddings)
-            _ = embeddings_global[start_idx:end_idx]
-            if i % 1000000 == 0:  # Log progress
-                logging.info(f"Touched {i:,} vectors...")
-
-        touch_end_time = time.perf_counter()
-        logging.info(f"Embeddings memmap pre-loading completed in {touch_end_time - touch_start_time:.2f}s")
-    else:
-        logging.info("Skipping embeddings pre-loading (already in RAM)")
-
-    logging.info(f"Server startup is completed. Total time: {time.perf_counter() - startup_timer_start:.4f} seconds")
+@app.on_event("startup")
+async def startup_event():
+    """Start the server and begin initialization in background"""
+    # Start initialization in background
+    asyncio.create_task(initialize_server_async())
 
 
 @app.on_event("shutdown")
@@ -373,18 +424,43 @@ async def shutdown_event():
 
 @app.get("/health")
 async def health_check():
-    """Health check endpoint for orchestrator"""
-    # Check if all global resources are initialized
-    expected_globals = [
-        index_global, cohere_client_global, embeddings_global, 
-        id_to_sorted_row_global, layout_prefix_global, 
-        lmdb_env_global, lmdb_metadata_db_global
-    ]
+    """Enhanced health check endpoint that reports initialization progress"""
+    with initialization_lock:
+        status_copy = initialization_status.copy()
+        stages_copy = {k: v.copy() for k, v in initialization_status["stages"].items()}
+        status_copy["stages"] = stages_copy
     
-    if any(item is None for item in expected_globals):
-        raise HTTPException(status_code=503, detail="Server not fully initialized")
+    # If there's an error, return 503
+    if status_copy.get("error"):
+        raise HTTPException(
+            status_code=503, 
+            detail={
+                "status": "error",
+                "error": status_copy["error"],
+                "progress": status_copy["progress"],
+                "stage": status_copy["stage"]
+            }
+        )
     
-    return {"status": "healthy", "message": "Semantic search server is ready"}
+    # If not ready yet, return 503 with progress info
+    if not status_copy.get("ready", False):
+        return {
+            "status": "initializing",
+            "progress": status_copy["progress"],
+            "stage": status_copy["stage"],
+            "message": status_copy["message"],
+            "stages": status_copy["stages"],
+            "elapsed_time": time.time() - status_copy["start_time"] if status_copy["start_time"] else 0
+        }
+    
+    # Server is ready
+    return {
+        "status": "ready",
+        "progress": 100,
+        "message": "Semantic search server is ready",
+        "ready": True,
+        "total_initialization_time": time.time() - status_copy["start_time"] if status_copy["start_time"] else 0
+    }
 
 @app.get("/status")
 async def status_check():
@@ -429,6 +505,10 @@ async def handle_query(request: QueryRequest):
         lmdb_env_global, lmdb_metadata_db_global
     ]
     if any(item is None for item in expected_globals):
+        # Server is not fully initialized - provide detailed status like health check
+        with initialization_lock:
+            status_copy = initialization_status.copy()
+        
         # For more detailed logging, find out which one is None
         uninitialized_globals = []
         global_names = [
@@ -439,8 +519,24 @@ async def handle_query(request: QueryRequest):
         for i, item in enumerate(expected_globals):
             if item is None:
                 uninitialized_globals.append(global_names[i])
-        logging.error(f"Server not fully initialized. The following global resources are None: {', '.join(uninitialized_globals)}")
-        raise HTTPException(status_code=503, detail="Server is not fully initialized. Please try again later.")
+        logging.error(f"Query attempted while server not fully initialized. Missing: {', '.join(uninitialized_globals)}")
+        
+        # Return detailed initialization status
+        elapsed_time = time.time() - status_copy["start_time"] if status_copy.get("start_time") else 0
+        
+        raise HTTPException(
+            status_code=503, 
+            detail={
+                "error": "Server is still initializing",
+                "status": "initializing",
+                "progress": status_copy.get("progress", 0),
+                "stage": status_copy.get("stage", "unknown"),
+                "message": status_copy.get("message", "Server is starting up..."),
+                "elapsed_time": elapsed_time,
+                "estimated_remaining": "Please check /health endpoint for real-time progress",
+                "missing_components": uninitialized_globals
+            }
+        )
 
     try:
         # 1. Get embedding from Cohere

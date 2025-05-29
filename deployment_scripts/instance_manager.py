@@ -350,19 +350,46 @@ sudo -u ec2-user bash -c 'cd /home/ec2-user/Neural_Search && source /opt/pytorch
 
 # Wait for server to be ready with timeout
 log "Waiting for server to be ready..."
-timeout=300  # 5 minutes
+timeout=900  # 15 minutes (increased from 5 minutes for large embedding loading)
 elapsed=0
+last_progress=-1
 while [ $elapsed -lt $timeout ]; do
     # Check if the HTTP endpoint is responding
     if curl -s http://localhost:8000/health > /dev/null 2>&1; then
-        log "Semantic search server is ready and responding"
-        echo "Instance ready" > /tmp/instance_ready
-        break
+        # Get the health response
+        health_response=$(curl -s http://localhost:8000/health 2>/dev/null)
+        
+        # Check if server is ready
+        if echo "$health_response" | grep -q '"status".*"ready"'; then
+            log "Semantic search server is ready and responding"
+            echo "Instance ready" > /tmp/instance_ready
+            break
+        fi
+        
+        # Check if server is initializing and extract progress
+        if echo "$health_response" | grep -q '"status".*"initializing"'; then
+            # Extract progress percentage (simple grep approach)
+            progress=$(echo "$health_response" | grep -o '"progress"[[:space:]]*:[[:space:]]*[0-9]*' | grep -o '[0-9]*$' || echo "0")
+            stage=$(echo "$health_response" | grep -o '"stage"[[:space:]]*:[[:space:]]*"[^"]*"' | sed 's/.*"\\([^"]*\\)".*/\\1/' || echo "unknown")
+            
+            # Only log progress updates to avoid spam
+            if [ "$progress" != "$last_progress" ] && [ -n "$progress" ]; then
+                log "Server initializing: $progress% - $stage"
+                last_progress="$progress"
+            fi
+        elif echo "$health_response" | grep -q '"status".*"error"'; then
+            log "ERROR: Server initialization failed"
+            echo "Setup failed: Server initialization error" > /tmp/setup_failed
+            exit 1
+        else
+            log "Server responding but status unclear"
+        fi
+    else
+        log "Waiting for server to start responding... ($elapsed/$timeout seconds)"
     fi
     
-    sleep 10
-    elapsed=$((elapsed + 10))
-    log "Waiting for server... ($elapsed/$timeout seconds)"
+    sleep 30  # Check every 30 seconds
+    elapsed=$((elapsed + 30))
 done
 
 if [ $elapsed -ge $timeout ]; then
@@ -382,27 +409,72 @@ log "Semantic search server setup completed successfully"
         if not instance:
             return
         
-        # Wait for the service to be ready
-        max_attempts = 60  # 10 minutes
+        # Wait for the service to be ready - increased timeout for large embedding loading
+        max_attempts = 90  # 15 minutes (increased from 10 minutes)
         attempt = 0
         
         while attempt < max_attempts:
             try:
-                async with httpx.AsyncClient(timeout=5.0) as client:
+                async with httpx.AsyncClient(timeout=10.0) as client:
                     response = await client.get(f"http://{instance.public_ip}:8000/health")
+                    
                     if response.status_code == 200:
-                        instance.status = InstanceStatus.READY
-                        print(f"Instance {instance_id} is ready")
-                        return
-            except:
-                pass
+                        # Server is ready
+                        response_data = response.json()
+                        if response_data.get("status") == "ready":
+                            instance.status = InstanceStatus.READY
+                            print(f"✓ Instance {instance_id} is ready")
+                            return
+                        else:
+                            # Server is still initializing, show progress
+                            progress = response_data.get("progress", 0)
+                            stage = response_data.get("stage", "unknown")
+                            message = response_data.get("message", "Initializing...")
+                            elapsed = response_data.get("elapsed_time", 0)
+                            print(f"Instance {instance_id} initializing: {progress}% - {stage} - {message} (elapsed: {elapsed:.0f}s)")
+                    
+                    elif response.status_code == 503:
+                        # Server returned error or still initializing
+                        try:
+                            error_data = response.json()
+                            if isinstance(error_data, dict) and "detail" in error_data:
+                                detail = error_data["detail"]
+                                if isinstance(detail, dict):
+                                    if detail.get("status") == "error":
+                                        print(f"✗ Instance {instance_id} initialization failed: {detail.get('error', 'Unknown error')}")
+                                        instance.status = InstanceStatus.FAILED
+                                        return
+                                    else:
+                                        # Still initializing
+                                        progress = detail.get("progress", 0)
+                                        stage = detail.get("stage", "unknown")
+                                        print(f"Instance {instance_id} initializing: {progress}% - {stage}")
+                                else:
+                                    print(f"Instance {instance_id} returned 503: {detail}")
+                            else:
+                                # Handle case where response is initializing status
+                                if error_data.get("status") == "initializing":
+                                    progress = error_data.get("progress", 0)
+                                    stage = error_data.get("stage", "unknown")
+                                    message = error_data.get("message", "Initializing...")
+                                    elapsed = error_data.get("elapsed_time", 0)
+                                    print(f"Instance {instance_id} initializing: {progress}% - {stage} - {message} (elapsed: {elapsed:.0f}s)")
+                                else:
+                                    print(f"Instance {instance_id} health check returned 503: {error_data}")
+                        except:
+                            print(f"Instance {instance_id} health check returned 503 (could not parse response)")
+                    else:
+                        print(f"Instance {instance_id} health check returned {response.status_code}")
+                        
+            except Exception as e:
+                print(f"Instance {instance_id} health check failed: {e}")
             
-            await asyncio.sleep(10)
+            await asyncio.sleep(10)  # Check every 10 seconds
             attempt += 1
         
-        # If we get here, the instance failed to start
+        # If we get here, the instance failed to start within timeout
         instance.status = InstanceStatus.FAILED
-        print(f"Instance {instance_id} failed to start")
+        print(f"✗ Instance {instance_id} failed to start within {max_attempts * 10 // 60} minutes")
     
     async def get_available_instance(self) -> Optional[ManagedInstance]:
         """Get an available instance, launching one if necessary"""
@@ -434,9 +506,10 @@ log "Semantic search server setup completed successfully"
         
         return None
     
-    async def _wait_for_instance_ready(self, instance: ManagedInstance, timeout: int = 300) -> Optional[ManagedInstance]:
-        """Wait for an instance to become ready"""
+    async def _wait_for_instance_ready(self, instance: ManagedInstance, timeout: int = 1800) -> Optional[ManagedInstance]:
+        """Wait for an instance to become ready with enhanced status reporting"""
         start_time = time.time()
+        last_progress_report = 0
         
         while time.time() - start_time < timeout:
             if instance.status == InstanceStatus.READY:
@@ -444,28 +517,120 @@ log "Semantic search server setup completed successfully"
             elif instance.status == InstanceStatus.FAILED:
                 return None
             
+            # Try to get status update from health check
+            try:
+                async with httpx.AsyncClient(timeout=10.0) as client:
+                    response = await client.get(f"http://{instance.public_ip}:8000/health")
+                    
+                    if response.status_code == 200:
+                        response_data = response.json()
+                        if response_data.get("status") == "ready":
+                            instance.status = InstanceStatus.READY
+                            return instance
+                        else:
+                            # Show progress updates
+                            progress = response_data.get("progress", 0)
+                            stage = response_data.get("stage", "unknown")
+                            message = response_data.get("message", "Initializing...")
+                            elapsed = response_data.get("elapsed_time", 0)
+                            
+                            # Only print progress updates every 10% or stage change
+                            if progress >= last_progress_report + 10 or stage != getattr(instance, '_last_stage', ''):
+                                print(f"Instance {instance.instance_id} progress: {progress}% - {stage} - {message} (elapsed: {elapsed:.0f}s)")
+                                last_progress_report = progress
+                                instance._last_stage = stage
+                                
+                    elif response.status_code == 503:
+                        # Handle initialization status
+                        try:
+                            error_data = response.json()
+                            if isinstance(error_data, dict):
+                                if "detail" in error_data:
+                                    detail = error_data["detail"]
+                                    if isinstance(detail, dict) and detail.get("status") == "error":
+                                        print(f"✗ Instance {instance.instance_id} initialization failed: {detail.get('error', 'Unknown error')}")
+                                        instance.status = InstanceStatus.FAILED
+                                        return None
+                                elif error_data.get("status") == "initializing":
+                                    progress = error_data.get("progress", 0)
+                                    stage = error_data.get("stage", "unknown")
+                                    message = error_data.get("message", "Initializing...")
+                                    elapsed = error_data.get("elapsed_time", 0)
+                                    
+                                    if progress >= last_progress_report + 10 or stage != getattr(instance, '_last_stage', ''):
+                                        print(f"Instance {instance.instance_id} progress: {progress}% - {stage} - {message} (elapsed: {elapsed:.0f}s)")
+                                        last_progress_report = progress
+                                        instance._last_stage = stage
+                        except:
+                            pass  # Continue waiting
+                            
+            except:
+                pass  # Continue waiting
+            
             await asyncio.sleep(5)
         
         # Timeout - mark as failed
+        elapsed_minutes = timeout // 60
+        print(f"✗ Instance {instance.instance_id} failed to become ready within {elapsed_minutes} minutes")
         instance.status = InstanceStatus.FAILED
         return None
     
     async def health_check_instance(self, instance: ManagedInstance):
-        """Perform health check on a single instance"""
+        """Perform health check on a single instance with enhanced status reporting"""
         try:
-            async with httpx.AsyncClient(timeout=5.0) as client:
+            async with httpx.AsyncClient(timeout=10.0) as client:
                 response = await client.get(f"http://{instance.public_ip}:8000/health")
+                
                 if response.status_code == 200:
-                    instance.health_check_failures = 0
+                    # Server is ready and healthy
+                    response_data = response.json()
+                    if response_data.get("status") == "ready":
+                        instance.health_check_failures = 0
+                        # Update last_used to current time since it's responding
+                        instance.last_used = datetime.now()
+                    else:
+                        # Server is still initializing
+                        progress = response_data.get("progress", 0)
+                        stage = response_data.get("stage", "unknown")
+                        print(f"Instance {instance.instance_id} still initializing: {progress}% - {stage}")
+                        instance.health_check_failures = 0  # Don't count initialization as failure
+                        
+                elif response.status_code == 503:
+                    # Server returned error or still initializing
+                    try:
+                        error_data = response.json()
+                        if isinstance(error_data, dict):
+                            if "detail" in error_data:
+                                detail = error_data["detail"]
+                                if isinstance(detail, dict) and detail.get("status") == "error":
+                                    print(f"Instance {instance.instance_id} reported error: {detail.get('error', 'Unknown error')}")
+                                    instance.health_check_failures += 1
+                                else:
+                                    # Still initializing
+                                    instance.health_check_failures = 0
+                            elif error_data.get("status") == "initializing":
+                                # Server is initializing
+                                progress = error_data.get("progress", 0)
+                                stage = error_data.get("stage", "unknown")
+                                print(f"Instance {instance.instance_id} initializing: {progress}% - {stage}")
+                                instance.health_check_failures = 0
+                            else:
+                                instance.health_check_failures += 1
+                        else:
+                            instance.health_check_failures += 1
+                    except:
+                        instance.health_check_failures += 1
                 else:
                     instance.health_check_failures += 1
-        except:
+                    
+        except Exception as e:
+            print(f"Health check failed for instance {instance.instance_id}: {e}")
             instance.health_check_failures += 1
         
         # If too many failures, mark as failed
         if instance.health_check_failures >= 3:
             instance.status = InstanceStatus.FAILED
-            print(f"Instance {instance.instance_id} marked as failed due to health check failures")
+            print(f"✗ Instance {instance.instance_id} marked as failed due to {instance.health_check_failures} consecutive health check failures")
     
     async def terminate_instance(self, instance_id: str):
         """Terminate a specific instance"""

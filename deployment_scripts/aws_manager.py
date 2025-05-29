@@ -242,9 +242,11 @@ class AWSManager:
         # Handle spot instances
         if self.config.use_spot_instances:
             spot_spec = {
-                'SpotPrice': self.config.spot_max_price or '',  # Empty string means current spot price
-                'Type': 'one-time'
+                'SpotInstanceType': 'one-time'
             }
+            if self.config.spot_max_price:
+                spot_spec['MaxPrice'] = self.config.spot_max_price
+            
             launch_params['InstanceMarketOptions'] = {
                 'MarketType': 'spot',
                 'SpotOptions': spot_spec

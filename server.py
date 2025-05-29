@@ -273,7 +273,12 @@ async def initialize_server_async():
         def _load_embeddings_to_ram_sync():
             logging.info(f"Worker thread (Embeddings): Loading into RAM (~{embedding_size_gb:.1f} GB)...")
             mmap_view = np.memmap(EMBEDDINGS_PATH, dtype=np.float16, mode="r", shape=(total_embeddings, VECTOR_DIM))
+            
+            copy_start_time = time.perf_counter()
             embeddings_ram = mmap_view.copy(order="C")
+            copy_duration = time.perf_counter() - copy_start_time
+            logging.info(f"WORKER THREAD (EmbeddingsLoadToRAM): mmap_view.copy() took {copy_duration:.2f}s.")
+            
             mmap_view._mmap.close()
             del mmap_view
             logging.info(f"Worker thread (Embeddings): Loaded into RAM.")
@@ -287,18 +292,27 @@ async def initialize_server_async():
 
         # LMDB page warmup helper (already defined, uses lmdb_env_global from above)
         def _initialize_lmdb_page_warmup_sync(): # Already defined from previous step
+            task_start_time = time.perf_counter()
             logging.info("Initialization (thread LMDB Warmup): Touching LMDB pages...")
             count = 0
+            loop_duration = 0.0
             try:
                 with lmdb_env_global.begin(db=lmdb_metadata_db_global, buffers=True) as txn_touch:
                     cur_touch = txn_touch.cursor()
+                    
+                    loop_start_time = time.perf_counter()
                     for _ in cur_touch:
                         count += 1
                         if count % 5_000_000 == 0:
                             logging.info(f"Initialization (thread LMDB Warmup): Touched {count:,} LMDB records...")
+                    loop_duration = time.perf_counter() - loop_start_time
+                    logging.info(f"WORKER THREAD (LMDBWarmup): Iteration loop took {loop_duration:.2f}s.")
+
             except Exception as e_lmdb_touch:
                 logging.error(f"Initialization (thread LMDB Warmup): Error during page touching: {e_lmdb_touch}", exc_info=True)
-            logging.info(f"Initialization (thread LMDB Warmup): Finished touching {count:,} LMDB records")
+            
+            total_function_duration = time.perf_counter() - task_start_time
+            logging.info(f"WORKER THREAD (LMDBWarmup): Finished page touching. Touched {count:,} records. Loop: {loop_duration:.2f}s. Total function time: {total_function_duration:.2f}s.")
             return count
 
         # Create tasks for parallel execution

@@ -99,82 +99,23 @@ class QueryResponse(BaseModel):
     results: list[ResultItem]
     timings: dict
 
-
 def get_vectors_server(ids: np.ndarray, emb_map: np.ndarray, id_to_sorted_row_map: np.ndarray, current_layout_prefix: np.ndarray) -> np.ndarray:
-    start_time = time.perf_counter()
+    """
+    Fetches full embedding vectors for given original vector IDs.
+    Uses simple numpy operations for better performance with typical small numbers of unique lists.
+    """
     rows = id_to_sorted_row_map[ids]
     lists = np.searchsorted(current_layout_prefix, rows, 'right') - 1
     out = np.empty((len(ids), VECTOR_DIM), dtype=np.float16)
-    print(f"Setup time: {time.perf_counter() - start_time:.4f} s")
-
-    def process_list(list_idx):
-        start = time.perf_counter()
-        start_offset = current_layout_prefix[list_idx]
-        end_offset = current_layout_prefix[list_idx + 1]
-        mask = (lists == list_idx)
-        offsets_in_list_block = rows[mask] - start_offset
-        vectors = emb_map[start_offset:end_offset][offsets_in_list_block]
-        print(f"List {list_idx} fetch time: {time.perf_counter() - start:.4f} s")
-        return mask, vectors
-
-    unique_lists = np.unique(lists)
-
-    fetch_start = time.perf_counter()
-    futures = {thread_pool_global.submit(process_list, list_idx): list_idx 
-                for list_idx in unique_lists}
-    for future in as_completed(futures):
-        mask, vectors = future.result()
-        out[mask] = vectors
-    print(f"Total fetch time: {time.perf_counter() - fetch_start:.4f} s")
-
-    print(f"Total time: {time.perf_counter() - start_time:.4f} s")
-    return out
-
-
-
-# def get_vectors_server(ids: np.ndarray, emb_map: np.memmap, id_to_sorted_row_map: np.ndarray, current_layout_prefix: np.ndarray) -> np.ndarray:
-#     """
-#     Fetches full embedding vectors for given original vector IDs.
-#     Assumes emb_map contains embeddings sorted list-wise.
-#     Now uses global thread pool to parallelize list processing for better performance.
-#     """
-#     rows = id_to_sorted_row_map[ids]  # Convert original IDs to sorted row indices
-#     # Determine which list each sorted row index belongs to
-#     lists = np.searchsorted(current_layout_prefix, rows, 'right') - 1
-#     out = np.empty((len(ids), VECTOR_DIM), dtype=np.float16)
-
-#     def process_list(list_idx):
-#         """Process a single list and return mask and vectors for that list."""
-#         start_offset = current_layout_prefix[list_idx]
-#         # Assumes current_layout_prefix has num_lists + 1 elements for the end boundary
-#         end_offset = current_layout_prefix[list_idx + 1] 
-#         mask = (lists == list_idx)
-#         # Offsets within the specific list's block in emb_map
-#         offsets_in_list_block = rows[mask] - start_offset
-#         vectors = emb_map[start_offset:end_offset][offsets_in_list_block]
-#         return mask, vectors
-
-#     unique_lists = np.unique(lists)
     
-#     # If only one list, no need for threading overhead
-#     if len(unique_lists) == 1:
-#         list_idx = unique_lists[0]
-#         start_offset = current_layout_prefix[list_idx]
-#         end_offset = current_layout_prefix[list_idx + 1] 
-#         mask = (lists == list_idx)
-#         offsets_in_list_block = rows[mask] - start_offset
-#         out[mask] = emb_map[start_offset:end_offset][offsets_in_list_block]
-#     else:
-#         # Use global thread pool for multiple lists
-#         futures = {thread_pool_global.submit(process_list, list_idx): list_idx 
-#                   for list_idx in unique_lists}
-        
-#         # Collect results as they complete
-#         for future in as_completed(futures):
-#             mask, vectors = future.result()
-#             out[mask] = vectors
-
-#     return out # Returns float16 vectors
+    unique_lists = np.unique(lists)
+    
+    for list_idx in unique_lists:
+        mask = (lists == list_idx)
+        # Direct fancy indexing - no intermediate slice copy
+        out[mask] = emb_map[rows[mask]]
+    
+    return out
 
 def get_metadata_lmdb_server(original_vector_ids: np.ndarray, txn: lmdb.Transaction, db: Any, id_to_sorted_row_map: np.ndarray):
     """
@@ -301,9 +242,12 @@ async def initialize_server_async():
             update_stage_status("embeddings", "in_progress", f"Loading {embedding_size_gb:.1f} GB into RAM...")
             logging.info(f"Loading embeddings into RAM (requires ~{embedding_size_gb:.1f} GB)...")
             
-            embeddings_mmap = np.memmap(EMBEDDINGS_PATH, dtype=np.float16, mode="r", shape=(total_embeddings, VECTOR_DIM))
-            embeddings_global = np.array(embeddings_mmap, dtype=np.float16)
-            del embeddings_mmap
+            mmap_view = np.memmap(EMBEDDINGS_PATH, dtype=np.float16, mode="r", shape=(total_embeddings, VECTOR_DIM))
+            
+            embeddings_global = mmap_view.copy(order="C")
+            
+            mmap_view._mmap.close()   # low-level unmap
+            del mmap_view             # drop Python ref
             
             update_stage_status("embeddings", "completed", f"Embeddings loaded into RAM ({embedding_size_gb:.1f} GB)")
             logging.info(f"Embeddings loaded into RAM ({embedding_size_gb:.1f} GB). Maximum performance mode enabled.")

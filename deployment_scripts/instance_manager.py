@@ -210,7 +210,7 @@ VOLUME_ID_CLEAN=${{VOLUME_ID#vol-}}
 log "Looking for EBS volume with ID: $VOLUME_ID_CLEAN"
 
 # Wait for EBS volume to be available and find it using volume ID
-max_attempts=24  # 2 minutes
+max_attempts=48  # 4 minutes
 attempt=0
 ebs_device=""
 
@@ -287,17 +287,17 @@ fi
 cd Neural_Search
 log "Repository cloned successfully"
 
-# Activate the pre-installed conda environment with PyTorch and CUDA
-log "Activating PyTorch conda environment..."
-source /opt/miniconda3/bin/activate pytorch
+# Activate the PyTorch virtual environment (PyTorch 2.6+ uses venv instead of conda)
+log "Activating PyTorch virtual environment..."
+source /opt/pytorch/bin/activate
 
-# Verify conda environment is active
-if [ "$CONDA_DEFAULT_ENV" != "pytorch" ]; then
-    log "ERROR: Failed to activate pytorch conda environment"
-    echo "Setup failed: Conda environment activation failed" > /tmp/setup_failed
+# Verify virtual environment is active
+if [ -z "$VIRTUAL_ENV" ] || [ ! -f "/opt/pytorch/bin/python" ]; then
+    log "ERROR: Failed to activate PyTorch virtual environment"
+    echo "Setup failed: Virtual environment activation failed" > /tmp/setup_failed
     exit 1
 fi
-log "PyTorch environment activated: $CONDA_DEFAULT_ENV"
+log "PyTorch virtual environment activated: $VIRTUAL_ENV"
 
 # Install Python dependencies with error checking
 log "Installing Python dependencies..."
@@ -340,13 +340,13 @@ sudo -u ec2-user bash -c 'echo "export DATA_DIR=\"/data\"" >> /home/ec2-user/.ba
 sudo -u ec2-user bash -c 'echo "export COHERE_API_KEY=\"{self.config.cohere_api_key}\"" >> /home/ec2-user/.bashrc'
 sudo -u ec2-user bash -c 'echo "export LOAD_EMBEDDINGS_TO_RAM=\"{self.config.load_embeddings_to_ram}\"" >> /home/ec2-user/.bashrc'
 
-# Ensure the conda environment is activated for future sessions
-sudo -u ec2-user bash -c 'echo "source /opt/miniconda3/bin/activate pytorch" >> /home/ec2-user/.bashrc'
+# Ensure the PyTorch virtual environment is activated for future sessions
+sudo -u ec2-user bash -c 'echo "source /opt/pytorch/bin/activate" >> /home/ec2-user/.bashrc'
 
 # Start the semantic search server with data paths pointing to EBS volume
 log "Starting semantic search server..."
 # Run the server as ec2-user for proper permissions
-sudo -u ec2-user bash -c 'cd /home/ec2-user/Neural_Search && source /opt/miniconda3/bin/activate pytorch && DATA_DIR="/data" COHERE_API_KEY="{self.config.cohere_api_key}" LOAD_EMBEDDINGS_TO_RAM="{self.config.load_embeddings_to_ram}" nohup /opt/miniconda3/envs/pytorch/bin/python server.py > server.log 2>&1 &'
+sudo -u ec2-user bash -c 'cd /home/ec2-user/Neural_Search && source /opt/pytorch/bin/activate && DATA_DIR="/data" COHERE_API_KEY="{self.config.cohere_api_key}" LOAD_EMBEDDINGS_TO_RAM="{self.config.load_embeddings_to_ram}" nohup python server.py > server.log 2>&1 &'
 
 # Wait for server to be ready with timeout
 log "Waiting for server to be ready..."

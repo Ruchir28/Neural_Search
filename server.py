@@ -95,6 +95,8 @@ class ResultItem(BaseModel):
     rank: int
     score: float
     text: str
+    title: str
+    url: str
 
 class QueryResponse(BaseModel):
     results: list[ResultItem]
@@ -148,19 +150,31 @@ def get_metadata_lmdb_server(original_vector_ids: np.ndarray, txn: lmdb.Transact
         decode_start_time = time.perf_counter()
         if binary_data_buffer:
             try:
-                # Assuming format: text_len (I), title_len (I), url_len (I), text (bytes), title (bytes), url (bytes)
-                # We only need the text for now.
-                text_len, _, _ = struct.unpack_from("!III", binary_data_buffer, 0) # title_len, url_len not used
+                # Format: text_len (I), title_len (I), url_len (I), text (bytes), title (bytes), url (bytes)
+                text_len, title_len, url_len = struct.unpack_from("!III", binary_data_buffer, 0)
                 offset = 12 # Size of III (3*4 bytes)
+                
+                # Extract text
                 text_slice = binary_data_buffer[offset : offset + text_len]
                 text = text_slice.tobytes().decode('utf-8', errors='replace')
-                record = {'text': text}
+                offset += text_len
+                
+                # Extract title
+                title_slice = binary_data_buffer[offset : offset + title_len]
+                title = title_slice.tobytes().decode('utf-8', errors='replace')
+                offset += title_len
+                
+                # Extract url
+                url_slice = binary_data_buffer[offset : offset + url_len]
+                url = url_slice.tobytes().decode('utf-8', errors='replace')
+                
+                record = {'text': text, 'title': title, 'url': url}
             except Exception as e:
                 logging.error(f"Error decoding LMDB data for key {lmdb_key_val}: {e}")
-                record = {'text': f'Error decoding metadata for ID {lmdb_key_val}'}
+                record = {'text': f'Error decoding metadata for ID {lmdb_key_val}', 'title': 'Error', 'url': 'Error'}
         else:
             logging.warning(f"LMDB key {lmdb_key_val} (original vec_id {original_vector_ids[original_pos_idx]}) not found.")
-            record = {'text': f'No metadata found for LMDB key {lmdb_key_val}'}
+            record = {'text': f'No metadata found for LMDB key {lmdb_key_val}', 'title': 'Not found', 'url': 'Not found'}
         decode_end_time = time.perf_counter()
         total_decode_time += (decode_end_time - decode_start_time)
         results_in_original_order[original_pos_idx] = record
@@ -425,7 +439,7 @@ async def run_warmup():
                     def _warmup_get_metadata_sync():
                         logging.info("AppWarmup (thread): Getting metadata from LMDB...") # Changed log prefix
                         with lmdb_env_global.begin(db=lmdb_metadata_db_global, buffers=True) as txn_warmup:
-                            meta = get_metadata_lmdb_server(valid_candidates_warmup[:FINAL_K], txn_warmup, lmdb_metadata_db_global, id_to_sorted_row_global)
+                            meta, _, _ = get_metadata_lmdb_server(valid_candidates_warmup[:FINAL_K], txn_warmup, lmdb_metadata_db_global, id_to_sorted_row_global)
                         logging.info("AppWarmup (thread): Got metadata from LMDB.")
                         return meta
                     _ = await asyncio.to_thread(_warmup_get_metadata_sync)
@@ -655,7 +669,13 @@ async def handle_query(request: QueryRequest):
         # 7. Format results
         output_results = []
         for rank, (item, score) in enumerate(zip(metadata_batch, final_top_scores), 1):
-            output_results.append(ResultItem(rank=rank, score=float(score), text=item['text']))
+            output_results.append(ResultItem(
+                rank=rank, 
+                score=float(score), 
+                text=item['text'],
+                title=item['title'],
+                url=item['url']
+            ))
 
         total_query_processing_time = time.perf_counter() - query_processing_start_time
         timings['total_query_processing_time'] = total_query_processing_time
